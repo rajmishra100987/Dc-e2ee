@@ -300,7 +300,7 @@ async function runPlaywrightBot(taskId, cookiesStr, threadId, e2eePin, prefix, m
             throw new Error(`Chat input box not found. Check screenshot at /api/screenshot/${taskId}`);
         }
 
-        task.logs.push(`[${new Date().toLocaleTimeString()}] Connected to E2EE Chat using '${inputSelector}'. Starting loop...`);
+        task.logs.push(`[${new Date().toLocaleTimeString()}] Connected to Chat using '${inputSelector}'. Starting loop...`);
 
         let index = 0;
 
@@ -309,16 +309,17 @@ async function runPlaywrightBot(taskId, cookiesStr, threadId, e2eePin, prefix, m
             const finalPayload = (prefix ? prefix + " " : "") + rawMsg;
 
             try {
-                // --- NO TYPING INDICATOR INSTANT TEXT INJECTION ---
-                await page.evaluate(({ selector, text }) => {
-                    const el = document.querySelector(selector);
-                    if (el) {
-                        el.focus();
-                        document.execCommand('insertText', false, text);
-                        el.dispatchEvent(new Event('input', { bubbles: true }));
-                    }
-                }, { selector: inputSelector, text: finalPayload });
+                // 1. Focus input box
+                const chatBox = page.locator(inputSelector).first();
+                await chatBox.click();
 
+                // 2. Instant batch text insert (updates React state without triggering typing indicator)
+                await page.keyboard.insertText(finalPayload);
+
+                // 3. Short delay for React state update
+                await page.waitForTimeout(150);
+
+                // 4. Send message
                 await page.keyboard.press('Enter');
 
                 task.logs.push(`[SUCCESS] Message Sent: "${finalPayload}"`);
