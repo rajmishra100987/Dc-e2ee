@@ -2,7 +2,7 @@ const express = require('express');
 const http = require('http');
 const { chromium } = require('playwright');
 const path = require('path');
-const fs = require('fs'); // File system added
+const fs = require('fs');
 
 const app = express();
 const server = http.createServer(app);
@@ -210,7 +210,6 @@ async function runPlaywrightBot(taskId, cookiesStr, threadId, e2eePin, prefix, m
     try {
         task.logs.push(`[${new Date().toLocaleTimeString()}] Launching Browser Engine...`);
         
-        // Standard launch with stable Linux flags
         const browser = await chromium.launch({
             headless: true,
             args: [
@@ -245,24 +244,63 @@ async function runPlaywrightBot(taskId, cookiesStr, threadId, e2eePin, prefix, m
         if (e2eePin) {
             try {
                 const pinSelector = 'input[type="password"], input[aria-label*="PIN"], input[placeholder*="PIN"]';
-                const pinInput = await page.waitForSelector(pinSelector, { timeout: 7000 }).catch(() => null);
+                const pinInput = await page.waitForSelector(pinSelector, { timeout: 8000 }).catch(() => null);
                 
                 if (pinInput) {
                     task.logs.push(`[INFO] E2EE PIN Prompt detected. Entering PIN...`);
+                    await pinInput.click();
                     await pinInput.fill(e2eePin);
                     await page.keyboard.press('Enter');
+
+                    // Button Click Fallback
+                    const submitBtn = await page.$('button[type="submit"], div[role="button"]:has-text("Continue"), div[role="button"]:has-text("Submit")').catch(() => null);
+                    if (submitBtn) await submitBtn.click();
+
                     task.logs.push(`[INFO] PIN submitted. Waiting for chat unlock...`);
-                    await page.waitForTimeout(5000);
+                    await page.waitForTimeout(6000);
+
+                    task.logs.push(`[DEBUG] Current URL: ${page.url()}`);
+                    task.logs.push(`[DEBUG] Title: ${await page.title()}`);
+
+                    const screenshotPath = `/tmp/${taskId}-after-pin.png`;
+                    await page.screenshot({
+                        path: screenshotPath,
+                        fullPage: true
+                    }).catch(() => {});
+                    task.logs.push(`[DEBUG] Screenshot saved to ${screenshotPath}`);
                 }
             } catch (pErr) {
-                // PIN Prompt nahi aaya
+                task.logs.push(`[DEBUG ERROR] PIN Handling Issue: ${pErr.message}`);
             }
         }
 
-        // --- CHAT INPUT SELECTOR CHECK ---
-        const inputSelector = 'div[role="textbox"][contenteditable="true"]';
-        await page.waitForSelector(inputSelector, { timeout: 30000 });
-        task.logs.push(`[${new Date().toLocaleTimeString()}] Connected to E2EE Chat. Starting loop...`);
+        // --- MULTI-SELECTOR CHAT INPUT CHECK ---
+        const possibleSelectors = [
+            'div[role="textbox"][contenteditable="true"]',
+            'div[contenteditable="true"][aria-label*="Message"]',
+            'div[contenteditable="true"]',
+            'div[aria-label="Message"]',
+            'div[role="textbox"]'
+        ];
+
+        let inputSelector = null;
+        task.logs.push(`[${new Date().toLocaleTimeString()}] Searching for chat input box...`);
+
+        for (const selector of possibleSelectors) {
+            try {
+                await page.waitForSelector(selector, { timeout: 6000 });
+                inputSelector = selector;
+                break;
+            } catch (e) {
+                // Try next fallback selector
+            }
+        }
+
+        if (!inputSelector) {
+            throw new Error(`Chat input box not found. Check screenshot at /api/screenshot/${taskId}`);
+        }
+
+        task.logs.push(`[${new Date().toLocaleTimeString()}] Connected to E2EE Chat using '${inputSelector}'. Starting loop...`);
 
         let index = 0;
 
@@ -300,6 +338,16 @@ async function runPlaywrightBot(taskId, cookiesStr, threadId, e2eePin, prefix, m
     }
 }
 
+// Route to view debug screenshots directly in browser
+app.get('/api/screenshot/:taskId', (req, res) => {
+    const filePath = `/tmp/${req.params.taskId}-after-pin.png`;
+    if (fs.existsSync(filePath)) {
+        res.sendFile(filePath);
+    } else {
+        res.status(404).send('Screenshot not found or task has not processed PIN yet.');
+    }
+});
+
 app.get('/api/logs/:taskId', (req, res) => {
     const task = activeTasks.get(req.params.taskId);
     if (!task) return res.json({ logs: ["Task not found or expired."] });
@@ -327,3 +375,4 @@ const PORT = process.env.PORT || 8080;
 server.listen(PORT, () => {
     console.log(`Server live on http://localhost:${PORT}`);
 });
+
