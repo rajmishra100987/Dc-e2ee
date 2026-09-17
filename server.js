@@ -16,6 +16,13 @@ const activeTasks = new Map();
 // Delay Helper
 const sleep = (sec) => new Promise((resolve) => setTimeout(resolve, sec * 1000));
 
+// Memory & RAM Cleanup Cleaner (Prevents Server Crash / Out of Memory)
+setInterval(() => {
+    if (global.gc) {
+        try { global.gc(); } catch (e) {}
+    }
+}, 5 * 60 * 1000); // Every 5 minutes
+
 // Cookie Parser Helper
 function parseCookies(cookieStr) {
     return cookieStr.split(';').map(pair => {
@@ -33,7 +40,7 @@ function parseCookies(cookieStr) {
     }).filter(Boolean);
 }
 
-// ---------------- DASHBOARD UI ----------------
+// ---------------- DASHBOARD UI (PINK + WHITE THEME) ----------------
 app.get('/', (req, res) => {
     res.send(`
 <!DOCTYPE html>
@@ -41,37 +48,44 @@ app.get('/', (req, res) => {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Messenger Playwright Auto Tool (With E2EE PIN)</title>
+    <title>Messenger Auto Tool - RAJ MISHRA</title>
     <style>
-        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #0f0f12; color: #e1e1e6; padding: 20px; margin: 0; }
-        .container { max-width: 650px; margin: 0 auto; background: #18181b; padding: 25px; border-radius: 12px; border: 1px solid #27272a; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }
-        h2 { text-align: center; color: #0084ff; margin-bottom: 20px; }
-        label { font-weight: 600; margin-top: 15px; display: block; color: #a1a1aa; font-size: 14px; }
-        input, textarea { width: 100%; padding: 10px; margin-top: 6px; border-radius: 6px; border: 1px solid #3f3f46; background: #27272a; color: #fff; box-sizing: border-box; }
-        textarea { height: 90px; }
-        .btn-start { background: #0084ff; color: white; width: 100%; margin-top: 20px; padding: 12px; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; font-size: 16px; }
-        .btn-stop { background: #ef4444; color: white; padding: 10px; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; }
-        .stop-box { margin-top: 25px; padding-top: 15px; border-top: 1px solid #27272a; display: flex; gap: 10px; }
-        #logBox { margin-top: 20px; background: #09090b; padding: 12px; height: 180px; overflow-y: auto; border-radius: 6px; font-family: monospace; font-size: 12px; border: 1px solid #27272a; color: #22c55e; }
-        .task-badge { background: #27272a; color: #0084ff; padding: 4px 8px; border-radius: 4px; font-weight: bold; }
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: linear-gradient(135deg, #fce7f3 0%, #ffffff 100%); color: #1f2937; padding: 20px; margin: 0; min-height: 100vh; }
+        .container { max-width: 680px; margin: 0 auto; background: #ffffff; padding: 30px; border-radius: 16px; border: 1px solid #fbcfe8; box-shadow: 0 12px 30px rgba(236, 72, 153, 0.15); }
+        h2 { text-align: center; color: #db2777; margin-bottom: 5px; font-size: 26px; }
+        .developer-tag { text-align: center; color: #6b7280; font-size: 13px; font-weight: bold; margin-bottom: 25px; letter-spacing: 1px; }
+        label { font-weight: 600; margin-top: 15px; display: block; color: #4b5563; font-size: 14px; }
+        input, textarea { width: 100%; padding: 12px; margin-top: 6px; border-radius: 8px; border: 1px solid #d1d5db; background: #fdf2f8; color: #1f2937; box-sizing: border-box; font-size: 14px; transition: all 0.3s; }
+        input:focus, textarea:focus { border-color: #ec4899; outline: none; background: #fff; box-shadow: 0 0 0 3px rgba(236, 72, 153, 0.1); }
+        textarea { height: 90px; resize: vertical; }
+        .btn-start { background: linear-gradient(135deg, #ec4899 0%, #db2777 100%); color: white; width: 100%; margin-top: 25px; padding: 14px; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; font-size: 16px; box-shadow: 0 4px 12px rgba(219, 39, 119, 0.3); transition: 0.2s; }
+        .btn-start:hover { opacity: 0.95; transform: translateY(-1px); }
+        .btn-stop { background: #ef4444; color: white; padding: 12px; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; transition: 0.2s; }
+        .btn-stop:hover { background: #dc2626; }
+        .stop-box { margin-top: 25px; padding-top: 20px; border-top: 2px dashed #f3f4f6; display: flex; gap: 10px; align-items: center; }
+        .stop-box input { margin-top: 0; }
+        #logBox { margin-top: 15px; background: #111827; padding: 15px; height: 200px; overflow-y: auto; border-radius: 8px; font-family: monospace; font-size: 12px; border: 1px solid #374151; color: #4ade80; box-shadow: inset 0 2px 4px rgba(0,0,0,0.5); }
+        .task-badge { background: #fdf2f8; color: #db2777; border: 1px solid #fbcfe8; padding: 4px 10px; border-radius: 6px; font-weight: bold; }
+        .status-container { display: flex; justify-content: space-between; align-items: center; margin-top: 20px; font-size: 14px; color: #4b5563; font-weight: 600; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h2>Messenger E2EE Bot Dashboard</h2>
+        <h2>Messenger Automation Bot</h2>
+        <div class="developer-tag">DEVELOPED BY : RAJ MISHRA</div>
         
         <form id="botForm">
-            <label>Messenger.com Cookie String:</label>
+            <label>Messenger Cookie String:</label>
             <textarea id="cookies" placeholder="c_user=...; xs=...; datr=...;" required></textarea>
 
             <label>Target UID / Thread ID:</label>
-            <input type="text" id="threadId" placeholder="e.g. 1000XXXXXXXXX ya Group ID" required>
+            <input type="text" id="threadId" placeholder="e.g. 1000XXXXXXXXX or Group ID" required>
 
-            <label>E2EE 6-Digit PIN (Optional / If required by Meta):</label>
+            <label>E2EE 6-Digit PIN (Optional):</label>
             <input type="password" id="e2eePin" placeholder="e.g. 123456">
 
             <label>Message Prefix (Optional):</label>
-            <input type="text" id="prefix" placeholder="e.g. [DevilX]">
+            <input type="text" id="prefix" placeholder="e.g. [RAJ]">
 
             <label>Messages (.txt File Choose Karein):</label>
             <input type="file" id="msgFile" accept=".txt" required>
@@ -83,12 +97,14 @@ app.get('/', (req, res) => {
         </form>
 
         <div class="stop-box">
-            <input type="text" id="stopTaskId" placeholder="Enter Task ID to stop (e.g. TASK-123456)">
+            <input type="text" id="stopTaskId" placeholder="Task ID to stop (e.g. TASK-123456)">
             <button type="button" class="btn-stop" onclick="stopTask()">STOP TASK</button>
         </div>
 
-        <label>Active Task Log (<span id="currentTaskId">No Task Running</span>):</label>
-        <div id="logBox">Waiting for input...</div>
+        <div class="status-container">
+            <span>Task Status: <span id="currentTaskId" class="task-badge">No Task Running</span></span>
+        </div>
+        <div id="logBox">Waiting for input logs...</div>
     </div>
 
     <script>
@@ -110,7 +126,7 @@ app.get('/', (req, res) => {
             const fileInput = document.getElementById('msgFile');
 
             if (!cookies || !threadId || fileInput.files.length === 0) {
-                alert('Cookies, UID aur Message file fill karein!');
+                alert('Cookies, UID aur Message file bharein!');
                 return;
             }
 
@@ -123,8 +139,6 @@ app.get('/', (req, res) => {
                 return;
             }
 
-            log("Task initializing...");
-
             const response = await fetch('/api/start', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -134,9 +148,9 @@ app.get('/', (req, res) => {
             const data = await response.json();
             if (data.success) {
                 activeTaskId = data.taskId;
-                document.getElementById('currentTaskId').innerHTML = '<span class="task-badge">' + activeTaskId + '</span>';
+                document.getElementById('currentTaskIdinnerHTML', activeTaskId);
+                document.getElementById('currentTaskId').innerHTML = activeTaskId;
                 document.getElementById('stopTaskId').value = activeTaskId;
-                log("Generated Task ID: " + activeTaskId);
                 
                 if(pollInterval) clearInterval(pollInterval);
                 pollInterval = setInterval(fetchLogs, 2000);
@@ -170,9 +184,9 @@ app.get('/', (req, res) => {
             });
 
             const data = await response.json();
-            log(data.message);
             if (taskId === activeTaskId) {
                 clearInterval(pollInterval);
+                document.getElementById('currentTaskId').innerHTML = 'Stopped';
             }
         }
     </script>
@@ -198,6 +212,7 @@ app.post('/api/start', async (req, res) => {
 
     activeTasks.set(taskId, taskData);
 
+    // Run asynchronously without blocking terminal
     runPlaywrightBot(taskId, cookies, threadId, e2eePin, prefix, messages, delay);
 
     res.json({ success: true, taskId });
@@ -207,8 +222,16 @@ async function runPlaywrightBot(taskId, cookiesStr, threadId, e2eePin, prefix, m
     const task = activeTasks.get(taskId);
     if (!task) return;
 
+    // Helper to safely push logs only to web dashboard array (Terminal remains 100% clean)
+    const addLog = (msg) => {
+        if (!task.logs) task.logs = [];
+        task.logs.push(`[${new Date().toLocaleTimeString()}] ${msg}`);
+        // Limit log array size to prevent memory buildup
+        if (task.logs.length > 150) task.logs.shift();
+    };
+
     try {
-        task.logs.push(`[${new Date().toLocaleTimeString()}] Launching Browser Engine...`);
+        addLog(`Launching Browser Engine...`);
         
         const browser = await chromium.launch({
             headless: true,
@@ -237,7 +260,7 @@ async function runPlaywrightBot(taskId, cookiesStr, threadId, e2eePin, prefix, m
 
         const page = await context.newPage();
 
-        task.logs.push(`[${new Date().toLocaleTimeString()}] Navigating to Target Thread: ${threadId}`);
+        addLog(`Navigating to Target Thread: ${threadId}`);
         await page.goto(`https://www.messenger.com/t/${threadId}`, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
         // --- E2EE PIN AUTO-FILL CHECK ---
@@ -247,34 +270,23 @@ async function runPlaywrightBot(taskId, cookiesStr, threadId, e2eePin, prefix, m
                 const pinInput = await page.waitForSelector(pinSelector, { timeout: 8000 }).catch(() => null);
                 
                 if (pinInput) {
-                    task.logs.push(`[INFO] E2EE PIN Prompt detected. Entering PIN...`);
+                    addLog(`E2EE PIN Prompt detected. Entering PIN...`);
                     await pinInput.click();
                     await pinInput.fill(e2eePin);
                     await page.keyboard.press('Enter');
 
-                    // Button Click Fallback
                     const submitBtn = await page.$('button[type="submit"], div[role="button"]:has-text("Continue"), div[role="button"]:has-text("Submit")').catch(() => null);
                     if (submitBtn) await submitBtn.click();
 
-                    task.logs.push(`[INFO] PIN submitted. Waiting for chat unlock...`);
+                    addLog(`PIN submitted. Waiting for chat unlock...`);
                     await page.waitForTimeout(6000);
-
-                    task.logs.push(`[DEBUG] Current URL: ${page.url()}`);
-                    task.logs.push(`[DEBUG] Title: ${await page.title()}`);
-
-                    const screenshotPath = `/tmp/${taskId}-after-pin.png`;
-                    await page.screenshot({
-                        path: screenshotPath,
-                        fullPage: true
-                    }).catch(() => {});
-                    task.logs.push(`[DEBUG] Screenshot saved to ${screenshotPath}`);
                 }
             } catch (pErr) {
-                task.logs.push(`[DEBUG ERROR] PIN Handling Issue: ${pErr.message}`);
+                addLog(`PIN Handling Warning: ${pErr.message}`);
             }
         }
 
-        // --- MULTI-SELECTOR CHAT INPUT CHECK ---
+        // --- CHAT INPUT SELECTOR CHECK ---
         const possibleSelectors = [
             'div[role="textbox"][contenteditable="true"]',
             'div[contenteditable="true"][aria-label*="Message"]',
@@ -284,47 +296,49 @@ async function runPlaywrightBot(taskId, cookiesStr, threadId, e2eePin, prefix, m
         ];
 
         let inputSelector = null;
-        task.logs.push(`[${new Date().toLocaleTimeString()}] Searching for chat input box...`);
+        addLog(`Searching for chat input box...`);
 
         for (const selector of possibleSelectors) {
             try {
                 await page.waitForSelector(selector, { timeout: 6000 });
                 inputSelector = selector;
                 break;
-            } catch (e) {
-                // Try next fallback selector
-            }
+            } catch (e) {}
         }
 
         if (!inputSelector) {
-            throw new Error(`Chat input box not found. Check screenshot at /api/screenshot/${taskId}`);
+            throw new Error(`Chat input box not found. Check cookies or target ID.`);
         }
 
-        task.logs.push(`[${new Date().toLocaleTimeString()}] Connected to Chat using '${inputSelector}'. Starting loop...`);
+        addLog(`Connected to Chat successfully. Starting infinite loop...`);
 
         let index = 0;
 
+        // --- INFINITE SAFE RUNNING LOOP ---
         while (task.isRunning) {
             const rawMsg = messages[index];
             const finalPayload = (prefix ? prefix + " " : "") + rawMsg;
 
             try {
-                // 1. Focus input box
-                const chatBox = page.locator(inputSelector).first();
-                await chatBox.click();
+                // Direct DOM Injection (0% Typing Indicator)
+                await page.evaluate(({ selector, text }) => {
+                    const el = document.querySelector(selector);
+                    if (el) {
+                        el.focus();
+                        el.innerHTML = '';
+                        const textNode = document.createTextNode(text);
+                        el.appendChild(textNode);
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                    }
+                }, { selector: inputSelector, text: finalPayload });
 
-                // 2. Instant batch text insert (updates React state without triggering typing indicator)
-                await page.keyboard.insertText(finalPayload);
-
-                // 3. Short delay for React state update
-                await page.waitForTimeout(150);
-
-                // 4. Send message
+                await page.waitForTimeout(100);
                 await page.keyboard.press('Enter');
 
-                task.logs.push(`[SUCCESS] Message Sent: "${finalPayload}"`);
+                addLog(`Message Sent: "${finalPayload}"`);
             } catch (err) {
-                task.logs.push(`[ERROR] Failed to send message: ${err.message}`);
+                addLog(`Send Error: ${err.message}`);
             }
 
             index = (index + 1) % messages.length;
@@ -335,10 +349,10 @@ async function runPlaywrightBot(taskId, cookiesStr, threadId, e2eePin, prefix, m
             }
         }
 
-        task.logs.push(`[${new Date().toLocaleTimeString()}] Task Loop Ended.`);
+        addLog(`Task Loop Terminated.`);
 
     } catch (err) {
-        task.logs.push(`[FATAL ERROR] ${err.message}`);
+        addLog(`FATAL ERROR: ${err.message}`);
     } finally {
         if (task.browser) {
             await task.browser.close().catch(() => {});
@@ -346,16 +360,6 @@ async function runPlaywrightBot(taskId, cookiesStr, threadId, e2eePin, prefix, m
         task.isRunning = false;
     }
 }
-
-// Route to view debug screenshots directly in browser
-app.get('/api/screenshot/:taskId', (req, res) => {
-    const filePath = `/tmp/${req.params.taskId}-after-pin.png`;
-    if (fs.existsSync(filePath)) {
-        res.sendFile(filePath);
-    } else {
-        res.status(404).send('Screenshot not found or task has not processed PIN yet.');
-    }
-});
 
 app.get('/api/logs/:taskId', (req, res) => {
     const task = activeTasks.get(req.params.taskId);
@@ -376,11 +380,13 @@ app.post('/api/stop', async (req, res) => {
         await task.browser.close().catch(() => {});
     }
 
-    task.logs.push(`[${new Date().toLocaleTimeString()}] Stop signal received. Task terminated.`);
+    if (task.logs) {
+        task.logs.push(`[${new Date().toLocaleTimeString()}] Stop signal received. Task terminated.`);
+    }
     res.json({ message: `Task ${taskId} is stopped!` });
 });
 
 const PORT = process.env.PORT || 8080;
 server.listen(PORT, () => {
-    console.log(`Server live on http://localhost:${PORT}`);
+    // Terminal stays clean as requested, only listening notification here
 });
