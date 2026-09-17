@@ -1,8 +1,6 @@
 const express = require('express');
 const http = require('http');
 const { chromium } = require('playwright');
-const path = require('path');
-const fs = require('fs');
 
 const app = express();
 const server = http.createServer(app);
@@ -28,6 +26,9 @@ process.on('SIGTERM', async () => {
     process.exit(0);
 });
 
+// ================== CONFIG ==================
+const BROWSER_RESTART_INTERVAL = 8 * 60 * 60 * 1000; // 8 hours
+
 // ================== GLOBAL BROWSER ==================
 let GLOBAL_BROWSER = null;
 
@@ -46,8 +47,6 @@ async function getBrowser() {
             '--disable-accelerated-2d-canvas',
             '--disable-gpu',
             '--no-first-run',
-            '--no-zygote',
-            '--single-process',
             '--disable-blink-features=AutomationControlled',
             '--disable-features=IsolateOrigins,site-per-process',
             '--disable-background-networking',
@@ -79,9 +78,11 @@ async function getBrowser() {
     return GLOBAL_BROWSER;
 }
 
+// ================== ACTIVE TASKS ==================
 const activeTasks = new Map();
 const sleep = (sec) => new Promise((resolve) => setTimeout(resolve, sec * 1000));
 
+// ================== COOKIE PARSER ==================
 function parseCookies(cookieStr) {
     const result = [];
     const seen = new Set();
@@ -111,6 +112,7 @@ function parseCookies(cookieStr) {
     return result;
 }
 
+// ================== HELPERS ==================
 async function findInputBox(page, timeout = 10000) {
     const selectors = [
         'div[contenteditable="true"][data-lexical-editor="true"]',
@@ -142,6 +144,60 @@ async function isSessionAlive(page) {
     }
 }
 
+// ================== SESSION SETUP (BROWSER RESTART KE LIYE REUSABLE) ==================
+async function setupSession(cookiesStr, threadId, e2eePin, addLog) {
+    const browser = await getBrowser();
+    
+    const context = await browser.newContext({
+        viewport: { width: 800, height: 600 },
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        locale: 'en-US',
+        timezoneId: 'Asia/Kolkata'
+    });
+    
+    await context.addInitScript(() => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        window.chrome = { runtime: {} };
+    });
+    
+    await context.addCookies(parseCookies(cookiesStr));
+    const page = await context.newPage();
+    
+    addLog(`Navigating to Thread: ${threadId}`);
+    await page.goto(`https://www.messenger.com/t/${threadId}`, { 
+        waitUntil: 'domcontentloaded', 
+        timeout: 90000 
+    });
+    await page.waitForTimeout(5000);
+    
+    // E2EE PIN
+    if (e2eePin) {
+        try {
+            const pinInput = await page.waitForSelector(
+                'input[type="password"], input[aria-label*="PIN"]', 
+                { timeout: 8000 }
+            ).catch(() => null);
+            
+            if (pinInput) {
+                addLog(`E2EE PIN prompt detected.`);
+                await pinInput.fill(e2eePin);
+                await page.keyboard.press('Enter');
+                await page.waitForTimeout(6000);
+            }
+        } catch (pErr) {}
+    }
+    
+    addLog(`Searching for input box...`);
+    const inputSelector = await findInputBox(page, 15000);
+    
+    if (!inputSelector) {
+        await context.close().catch(() => {});
+        throw new Error('Chat input box not found. Cookies ya Thread ID check karo.');
+    }
+    
+    return { browser, context, page, inputSelector };
+}
+
 // ================== DASHBOARD UI ==================
 app.get('/', (req, res) => {
     res.send(`
@@ -152,21 +208,34 @@ app.get('/', (req, res) => {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Messenger Auto Tool - RAJ MISHRA</title>
     <style>
+        * { box-sizing: border-box; }
         body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: linear-gradient(135deg, #fce7f3 0%, #ffffff 100%); color: #1f2937; padding: 20px; margin: 0; min-height: 100vh; }
-        .container { max-width: 680px; margin: 0 auto; background: #ffffff; padding: 30px; border-radius: 16px; border: 1px solid #fbcfe8; box-shadow: 0 12px 30px rgba(236, 72, 153, 0.15); }
+        .container { max-width: 720px; margin: 0 auto; background: #ffffff; padding: 30px; border-radius: 16px; border: 1px solid #fbcfe8; box-shadow: 0 12px 30px rgba(236, 72, 153, 0.15); }
         h2 { text-align: center; color: #db2777; margin-bottom: 5px; font-size: 26px; }
         .developer-tag { text-align: center; color: #6b7280; font-size: 13px; font-weight: bold; margin-bottom: 25px; letter-spacing: 1px; }
         label { font-weight: 600; margin-top: 15px; display: block; color: #4b5563; font-size: 14px; }
-        input, textarea { width: 100%; padding: 12px; margin-top: 6px; border-radius: 8px; border: 1px solid #d1d5db; background: #fdf2f8; color: #1f2937; box-sizing: border-box; font-size: 14px; }
+        input, textarea { width: 100%; padding: 12px; margin-top: 6px; border-radius: 8px; border: 1px solid #d1d5db; background: #fdf2f8; color: #1f2937; font-size: 14px; }
         input:focus, textarea:focus { border-color: #ec4899; outline: none; background: #fff; box-shadow: 0 0 0 3px rgba(236, 72, 153, 0.1); }
         textarea { height: 90px; resize: vertical; }
         .btn-start { background: linear-gradient(135deg, #ec4899 0%, #db2777 100%); color: white; width: 100%; margin-top: 25px; padding: 14px; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; font-size: 16px; box-shadow: 0 4px 12px rgba(219, 39, 119, 0.3); }
-        .btn-stop { background: #ef4444; color: white; padding: 12px; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; }
-        .stop-box { margin-top: 25px; padding-top: 20px; border-top: 2px dashed #f3f4f6; display: flex; gap: 10px; align-items: center; }
-        .stop-box input { margin-top: 0; }
-        #logBox { margin-top: 15px; background: #111827; padding: 15px; height: 200px; overflow-y: auto; border-radius: 8px; font-family: monospace; font-size: 12px; border: 1px solid #374151; color: #4ade80; }
-        .task-badge { background: #fdf2f8; color: #db2777; border: 1px solid #fbcfe8; padding: 4px 10px; border-radius: 6px; font-weight: bold; }
-        .status-container { display: flex; justify-content: space-between; align-items: center; margin-top: 20px; font-size: 14px; color: #4b5563; font-weight: 600; }
+        .btn-start:hover { opacity: 0.95; }
+        .btn-stop { background: #ef4444; color: white; padding: 12px 20px; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; white-space: nowrap; }
+        .btn-stop:hover { background: #dc2626; }
+        .btn-view { background: #8b5cf6; color: white; padding: 12px 20px; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; white-space: nowrap; }
+        .btn-view:hover { background: #7c3aed; }
+        .row { display: flex; gap: 10px; align-items: flex-end; margin-top: 10px; }
+        .row input { margin-top: 0; }
+        .monitor-card { margin-top: 25px; padding: 20px; background: linear-gradient(135deg, #fdf2f8 0%, #ffffff 100%); border: 2px solid #fbcfe8; border-radius: 12px; }
+        .monitor-card h3 { color: #db2777; margin: 0 0 15px 0; font-size: 16px; }
+        .stats-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 15px; }
+        .stat-box { background: #fff; padding: 12px; border-radius: 8px; border: 1px solid #fbcfe8; }
+        .stat-label { font-size: 11px; color: #6b7280; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
+        .stat-value { font-size: 18px; color: #db2777; font-weight: bold; margin-top: 4px; font-family: monospace; }
+        #logBox { background: #111827; padding: 15px; height: 250px; overflow-y: auto; border-radius: 8px; font-family: monospace; font-size: 12px; border: 1px solid #374151; color: #4ade80; }
+        #logBox .err { color: #f87171; }
+        #logBox .warn { color: #fbbf24; }
+        .divider { margin: 25px 0; border-top: 2px dashed #f3f4f6; }
+        .hint { font-size: 12px; color: #9ca3af; margin-top: 6px; }
     </style>
 </head>
 <body>
@@ -178,32 +247,52 @@ app.get('/', (req, res) => {
             <label>Messenger Cookie String:</label>
             <textarea id="cookies" placeholder="c_user=...; xs=...; datr=...;" required></textarea>
             <label>Target UID / Thread ID:</label>
-            <input type="text" id="threadId" placeholder="e.g. 1000XXXXXXXXX or Group ID" required>
+            <input type="text" id="threadId" placeholder="e.g. 1000XXXXXXXXX" required>
             <label>E2EE 6-Digit PIN (Optional):</label>
             <input type="password" id="e2eePin" placeholder="e.g. 123456">
             <label>Message Prefix (Optional):</label>
             <input type="text" id="prefix" placeholder="e.g. [RAJ]">
-            <label>Messages (.txt File Choose Karein):</label>
+            <label>Messages (.txt File):</label>
             <input type="file" id="msgFile" accept=".txt" required>
             <label>Delay (In Seconds):</label>
             <input type="number" id="delay" value="30" min="5" required>
             <button type="button" class="btn-start" onclick="startTask()">START TASK</button>
         </form>
 
-        <div class="stop-box">
-            <input type="text" id="stopTaskId" placeholder="Task ID to stop">
-            <button type="button" class="btn-stop" onclick="stopTask()">STOP TASK</button>
-        </div>
+        <div class="divider"></div>
 
-        <div class="status-container">
-            <span>Task Status: <span id="currentTaskId" class="task-badge">No Task Running</span></span>
+        <div class="monitor-card">
+            <h3>📊 Task Monitor</h3>
+            <label>Task ID (live logs + uptime dekhne ke liye):</label>
+            <div class="row">
+                <input type="text" id="monitorTaskId" placeholder="e.g. TASK-123456">
+                <button type="button" class="btn-view" onclick="viewTask()">VIEW</button>
+                <button type="button" class="btn-stop" onclick="stopTask()">STOP</button>
+            </div>
+
+            <div class="stats-grid" style="margin-top: 15px;">
+                <div class="stat-box">
+                    <div class="stat-label">Status</div>
+                    <div class="stat-value" id="statusBadge">—</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-label">Uptime</div>
+                    <div class="stat-value" id="uptime">—</div>
+                </div>
+            </div>
+
+            <div id="logBox">Waiting for task ID...</div>
         </div>
-        <div id="logBox">Waiting for input logs...</div>
     </div>
 
     <script>
-        let activeTaskId = null;
+        let monitorTaskId = null;
         let pollInterval = null;
+        let startedAt = null;
+
+        function escapeHtml(s) {
+            return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        }
 
         async function startTask() {
             const cookies = document.getElementById('cookies').value.trim();
@@ -220,6 +309,7 @@ app.get('/', (req, res) => {
 
             const text = await fileInput.files[0].text();
             const messages = text.split('\\n').map(m => m.trim()).filter(m => m.length > 0);
+            if (messages.length === 0) { alert('Message file khali hai!'); return; }
 
             const response = await fetch('/api/start', {
                 method: 'POST',
@@ -229,42 +319,78 @@ app.get('/', (req, res) => {
 
             const data = await response.json();
             if (data.success) {
-                activeTaskId = data.taskId;
-                document.getElementById('currentTaskId').innerHTML = activeTaskId;
-                document.getElementById('stopTaskId').value = activeTaskId;
-                if(pollInterval) clearInterval(pollInterval);
-                pollInterval = setInterval(fetchLogs, 2000);
+                document.getElementById('monitorTaskId').value = data.taskId;
+                viewTask();
             } else {
-                alert("Task Start Nahi Ho Payi!");
+                alert("Task start nahi ho payi!");
             }
         }
 
-        async function fetchLogs() {
-            if (!activeTaskId) return;
+        function viewTask() {
+            const taskId = document.getElementById('monitorTaskId').value.trim();
+            if (!taskId) { alert('Task ID daalein!'); return; }
+            
+            monitorTaskId = taskId;
+            startedAt = null;
+            document.getElementById('statusBadge').innerHTML = '—';
+            document.getElementById('uptime').innerHTML = '—';
+            document.getElementById('logBox').innerHTML = 'Loading logs...';
+            
+            if (pollInterval) clearInterval(pollInterval);
+            fetchStatus();
+            pollInterval = setInterval(fetchStatus, 2000);
+        }
+
+        async function fetchStatus() {
+            if (!monitorTaskId) return;
             try {
-                const res = await fetch('/api/logs/' + activeTaskId);
+                const res = await fetch('/api/status/' + monitorTaskId);
                 const data = await res.json();
-                if (data.logs) {
-                    const logBox = document.getElementById('logBox');
-                    logBox.innerHTML = data.logs.map(l => '<div>' + l + '</div>').join('');
-                    logBox.scrollTop = logBox.scrollHeight;
+                
+                if (!data.found) {
+                    document.getElementById('statusBadge').innerHTML = '❌ Not Found';
+                    document.getElementById('uptime').innerHTML = '—';
+                    document.getElementById('logBox').innerHTML = 'Task not found (expired or invalid ID)';
+                    return;
                 }
+                
+                startedAt = data.startedAt;
+                document.getElementById('statusBadge').innerHTML = data.isRunning ? '🟢 Running' : '🔴 Stopped';
+                
+                const logBox = document.getElementById('logBox');
+                logBox.innerHTML = data.logs.map(l => {
+                    let cls = '';
+                    if (l.includes('FATAL') || l.includes('Error') || l.includes('❌')) cls = 'err';
+                    else if (l.includes('⚠️') || l.includes('Warning')) cls = 'warn';
+                    return '<div class="' + cls + '">' + escapeHtml(l) + '</div>';
+                }).join('');
+                logBox.scrollTop = logBox.scrollHeight;
             } catch(e) {}
         }
 
         async function stopTask() {
-            const taskId = document.getElementById('stopTaskId').value.trim();
+            const taskId = document.getElementById('monitorTaskId').value.trim();
             if (!taskId) { alert('Task ID daalein!'); return; }
+            if (!confirm('Task ' + taskId + ' stop karein?')) return;
+            
             await fetch('/api/stop', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ taskId })
             });
-            if (taskId === activeTaskId) {
-                clearInterval(pollInterval);
-                document.getElementById('currentTaskId').innerHTML = 'Stopped';
-            }
+            fetchStatus();
         }
+
+        // Uptime ticker - har second update
+        setInterval(() => {
+            if (!startedAt) return;
+            const elapsed = Date.now() - startedAt;
+            const d = Math.floor(elapsed / 86400000);
+            const h = Math.floor((elapsed % 86400000) / 3600000);
+            const m = Math.floor((elapsed % 3600000) / 60000);
+            const s = Math.floor((elapsed % 60000) / 1000);
+            document.getElementById('uptime').innerHTML = d + 'd ' + h + 'h ' + m + 'm ' + s + 's';
+        }, 1000);
     </script>
 </body>
 </html>
@@ -275,6 +401,7 @@ app.get('/', (req, res) => {
 app.post('/api/start', async (req, res) => {
     const { cookies, threadId, e2eePin, prefix, messages, delay } = req.body;
     
+    // Purane running tasks band karo
     for (const [id, t] of activeTasks.entries()) {
         if (t.isRunning) {
             t.isRunning = false;
@@ -286,6 +413,7 @@ app.post('/api/start', async (req, res) => {
     const taskData = {
         taskId,
         isRunning: true,
+        startedAt: Date.now(),  // UPTIME KE LIYE
         logs: [`[${new Date().toLocaleTimeString()}] Task Initialized. ID: ${taskId}`],
         context: null
     };
@@ -298,7 +426,7 @@ app.post('/api/start', async (req, res) => {
             const t = activeTasks.get(taskId);
             if (t) {
                 t.isRunning = false;
-                t.logs.push(`[FATAL] ${err.message}`);
+                t.logs.push(`[${new Date().toLocaleTimeString()}] [FATAL] ${err.message}`);
             }
         });
 
@@ -313,94 +441,66 @@ async function runPlaywrightBot(taskId, cookiesStr, threadId, e2eePin, prefix, m
     const addLog = (msg) => {
         if (!task.logs) task.logs = [];
         task.logs.push(`[${new Date().toLocaleTimeString()}] ${msg}`);
-        if (task.logs.length > 100) task.logs.shift();
+        if (task.logs.length > 150) task.logs.shift();
     };
 
     let context = null;
     let page = null;
+    let inputSelector = null;
+    let lastRestart = Date.now();
 
     try {
-        addLog(`Getting browser...`);
-        const browser = await getBrowser();
-        
-        context = await browser.newContext({
-            viewport: { width: 800, height: 600 },
-            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            locale: 'en-US',
-            timezoneId: 'Asia/Kolkata'
-        });
-
+        addLog(`Setting up session...`);
+        const session = await setupSession(cookiesStr, threadId, e2eePin, addLog);
+        context = session.context;
+        page = session.page;
+        inputSelector = session.inputSelector;
         task.context = context;
-
-        await context.addInitScript(() => {
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            window.chrome = { runtime: {} };
-        });
-
-        await context.addCookies(parseCookies(cookiesStr));
-        page = await context.newPage();
-
-        // Crash handlers
-        page.on('crash', () => {
-            addLog(`💥 Page crashed!`);
-            task.isRunning = false;
-        });
-        page.on('close', () => {
-            if (task.isRunning) {
-                addLog(`⚠️ Page closed unexpectedly!`);
-                task.isRunning = false;
-            }
-        });
-        context.on('close', () => {
-            if (task.isRunning) {
-                addLog(`⚠️ Context closed!`);
-                task.isRunning = false;
-            }
-        });
-
-        addLog(`Navigating to Thread: ${threadId}`);
-        await page.goto(`https://www.messenger.com/t/${threadId}`, { 
-            waitUntil: 'domcontentloaded', 
-            timeout: 90000 
-        });
-        await page.waitForTimeout(5000);
-
-        if (e2eePin) {
-            try {
-                const pinInput = await page.waitForSelector(
-                    'input[type="password"], input[aria-label*="PIN"]', 
-                    { timeout: 8000 }
-                ).catch(() => null);
-                
-                if (pinInput) {
-                    addLog(`E2EE PIN prompt detected.`);
-                    await pinInput.fill(e2eePin);
-                    await page.keyboard.press('Enter');
-                    await page.waitForTimeout(6000);
-                }
-            } catch (pErr) {}
-        }
-
-        addLog(`Searching for input box...`);
-        let inputSelector = await findInputBox(page, 15000);
-
-        if (!inputSelector) {
-            throw new Error(`Chat input box not found. Cookies ya Thread ID check karo.`);
-        }
-
+        
         addLog(`✅ Connected. Starting loop...`);
+        addLog(`⏰ Auto browser restart har 8 ghante me hoga.`);
 
         let index = 0;
         let msgCount = 0;
 
         while (task.isRunning) {
-            // Health check
-            if (!page || page.isClosed() || !browser.isConnected()) {
-                addLog(`❌ Browser/Page dead. Stopping.`);
+            
+            // ========== 8 HOUR BROWSER RESTART ==========
+            if (Date.now() - lastRestart >= BROWSER_RESTART_INTERVAL) {
+                addLog(`🔄 8 ghante complete. Browser restart kar raha hoon...`);
+                
+                // Purana context band
+                try { await context.close(); } catch(e) {}
+                
+                // Global browser bhi reset (fresh Chromium)
+                if (GLOBAL_BROWSER) {
+                    try { await GLOBAL_BROWSER.close(); } catch(e) {}
+                    GLOBAL_BROWSER = null;
+                }
+                
+                // Naya session setup
+                try {
+                    const newSession = await setupSession(cookiesStr, threadId, e2eePin, addLog);
+                    context = newSession.context;
+                    page = newSession.page;
+                    inputSelector = newSession.inputSelector;
+                    task.context = context;
+                    lastRestart = Date.now();
+                    addLog(`✅ Browser restart successful. Loop continue.`);
+                } catch (rErr) {
+                    addLog(`❌ Browser restart fail: ${rErr.message}. Task stop.`);
+                    task.isRunning = false;
+                    break;
+                }
+            }
+            
+            // ========== HEALTH CHECK ==========
+            if (!page || page.isClosed() || !context) {
+                addLog(`❌ Page/Context dead. Stopping.`);
                 break;
             }
             
-            // Session check har 5 msg
+            // ========== SESSION CHECK har 5 msg ==========
             if (msgCount > 0 && msgCount % 5 === 0) {
                 const alive = await isSessionAlive(page);
                 if (!alive) {
@@ -444,7 +544,7 @@ async function runPlaywrightBot(taskId, cookiesStr, threadId, e2eePin, prefix, m
                 }
 
             } catch (err) {
-                addLog(`Send Error: ${err.message}`);
+                addLog(`⚠️ Send Error: ${err.message}`);
                 
                 if (err.message.includes('Input box') || err.message.includes('Target closed')) {
                     try {
@@ -467,8 +567,8 @@ async function runPlaywrightBot(taskId, cookiesStr, threadId, e2eePin, prefix, m
             index = (index + 1) % messages.length;
             msgCount++;
 
-            // Memory cleanup - har 30 msg
-            if (msgCount > 0 && msgCount % 30 === 0) {
+            // ========== MEMORY CLEANUP har 60 msg ==========
+            if (msgCount > 0 && msgCount % 60 === 0) {
                 addLog(`🔄 Memory cleanup - reload (msg #${msgCount})...`);
                 try {
                     await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 });
@@ -484,7 +584,7 @@ async function runPlaywrightBot(taskId, cookiesStr, threadId, e2eePin, prefix, m
                 }
             }
 
-            // ✅ FIXED DELAY - Dashboard me jo daala wahi exact
+            // ========== FIXED DELAY ==========
             for (let i = 0; i < delay; i++) {
                 if (!task.isRunning) break;
                 await sleep(1);
@@ -494,27 +594,30 @@ async function runPlaywrightBot(taskId, cookiesStr, threadId, e2eePin, prefix, m
         addLog(`Task loop ended.`);
 
     } catch (err) {
-        addLog(`FATAL: ${err.message}`);
+        addLog(`[FATAL] ${err.message}`);
         console.log('[BOT ERROR]', err.message);
     } finally {
         task.isRunning = false;
         try {
             if (context) await context.close();
         } catch (e) {}
-        
-        setTimeout(() => {
-            activeTasks.delete(taskId);
-        }, 5 * 60 * 1000);
     }
 }
 
-// ================== APIs ==================
-app.get('/api/logs/:taskId', (req, res) => {
+// ================== STATUS API (UPTIME + LOGS) ==================
+app.get('/api/status/:taskId', (req, res) => {
     const task = activeTasks.get(req.params.taskId);
-    if (!task) return res.json({ logs: ["Task not found or expired."] });
-    res.json({ logs: task.logs });
+    if (!task) return res.json({ found: false });
+    res.json({
+        found: true,
+        taskId: task.taskId,
+        isRunning: task.isRunning,
+        startedAt: task.startedAt,
+        logs: task.logs || []
+    });
 });
 
+// ================== STOP API ==================
 app.post('/api/stop', async (req, res) => {
     const { taskId } = req.body;
     const task = activeTasks.get(taskId);
@@ -522,7 +625,7 @@ app.post('/api/stop', async (req, res) => {
 
     task.isRunning = false;
     if (task.context) await task.context.close().catch(() => {});
-    if (task.logs) task.logs.push(`[${new Date().toLocaleTimeString()}] Stopped.`);
+    if (task.logs) task.logs.push(`[${new Date().toLocaleTimeString()}] 🛑 Stop signal received.`);
     res.json({ message: `Task ${taskId} stopped!` });
 });
 
@@ -545,7 +648,7 @@ setInterval(() => {
     const rssMB = Math.round(mem.rss / 1024 / 1024);
     console.log(`[MEMORY] RSS: ${rssMB}MB`);
     
-    if (rssMB > 430) {
+    if (rssMB > 850) {
         console.log('⚠️ High memory! Restarting browser...');
         if (GLOBAL_BROWSER) {
             GLOBAL_BROWSER.close().catch(() => {});
