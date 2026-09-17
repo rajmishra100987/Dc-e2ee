@@ -16,7 +16,7 @@ const activeTasks = new Map();
 // Delay Helper
 const sleep = (sec) => new Promise((resolve) => setTimeout(resolve, sec * 1000));
 
-// Memory & RAM Cleanup Cleaner (Prevents Server Crash / Out of Memory)
+// Memory & RAM Cleaner (Prevents Server Out-of-Memory Crashes)
 setInterval(() => {
     if (global.gc) {
         try { global.gc(); } catch (e) {}
@@ -148,7 +148,6 @@ app.get('/', (req, res) => {
             const data = await response.json();
             if (data.success) {
                 activeTaskId = data.taskId;
-                document.getElementById('currentTaskIdinnerHTML', activeTaskId);
                 document.getElementById('currentTaskId').innerHTML = activeTaskId;
                 document.getElementById('stopTaskId').value = activeTaskId;
                 
@@ -222,12 +221,11 @@ async function runPlaywrightBot(taskId, cookiesStr, threadId, e2eePin, prefix, m
     const task = activeTasks.get(taskId);
     if (!task) return;
 
-    // Helper to safely push logs only to web dashboard array (Terminal remains 100% clean)
+    // Helper to push logs ONLY to web dashboard (Terminal remains 100% clean)
     const addLog = (msg) => {
         if (!task.logs) task.logs = [];
         task.logs.push(`[${new Date().toLocaleTimeString()}] ${msg}`);
-        // Limit log array size to prevent memory buildup
-        if (task.logs.length > 150) task.logs.shift();
+        if (task.logs.length > 150) task.logs.shift(); // Keep array size controlled
     };
 
     try {
@@ -310,30 +308,28 @@ async function runPlaywrightBot(taskId, cookiesStr, threadId, e2eePin, prefix, m
             throw new Error(`Chat input box not found. Check cookies or target ID.`);
         }
 
-        addLog(`Connected to Chat successfully. Starting infinite loop...`);
+        addLog(`Connected to Chat successfully. Starting continuous infinite loop...`);
 
         let index = 0;
 
-        // --- INFINITE SAFE RUNNING LOOP ---
+        // --- CONTROLLED INFINITE LOOP (Runs until manually stopped or cookies expire) ---
         while (task.isRunning) {
             const rawMsg = messages[index];
             const finalPayload = (prefix ? prefix + " " : "") + rawMsg;
 
             try {
-                // Direct DOM Injection (0% Typing Indicator)
+                // Direct Native Insert Command (0% Typing Indicator + 100% Real Delivery via React/Lexical Sync)
                 await page.evaluate(({ selector, text }) => {
                     const el = document.querySelector(selector);
                     if (el) {
                         el.focus();
-                        el.innerHTML = '';
-                        const textNode = document.createTextNode(text);
-                        el.appendChild(textNode);
-                        el.dispatchEvent(new Event('input', { bubbles: true }));
-                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                        document.execCommand('selectAll', false, null);
+                        document.execCommand('delete', false, null);
+                        document.execCommand('insertText', false, text);
                     }
                 }, { selector: inputSelector, text: finalPayload });
 
-                await page.waitForTimeout(100);
+                await page.waitForTimeout(200);
                 await page.keyboard.press('Enter');
 
                 addLog(`Message Sent: "${finalPayload}"`);
@@ -388,5 +384,5 @@ app.post('/api/stop', async (req, res) => {
 
 const PORT = process.env.PORT || 8080;
 server.listen(PORT, () => {
-    // Terminal stays clean as requested, only listening notification here
+    // Terminal stays 100% clean as requested
 });
