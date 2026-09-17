@@ -309,8 +309,16 @@ async function runPlaywrightBot(taskId, cookiesStr, threadId, e2eePin, prefix, m
             const finalPayload = (prefix ? prefix + " " : "") + rawMsg;
 
             try {
-                await page.click(inputSelector);
-                await page.keyboard.type(finalPayload, { delay: 35 });
+                // --- NO TYPING INDICATOR INSTANT TEXT INJECTION ---
+                await page.evaluate(({ selector, text }) => {
+                    const el = document.querySelector(selector);
+                    if (el) {
+                        el.focus();
+                        document.execCommand('insertText', false, text);
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                    }
+                }, { selector: inputSelector, text: finalPayload });
+
                 await page.keyboard.press('Enter');
 
                 task.logs.push(`[SUCCESS] Message Sent: "${finalPayload}"`);
@@ -371,8 +379,7 @@ app.post('/api/stop', async (req, res) => {
     res.json({ message: `Task ${taskId} is stopped!` });
 });
 
-const PORT = process.env.PORT || 8080;
+const PORT = process process.env.PORT || 8080;
 server.listen(PORT, () => {
     console.log(`Server live on http://localhost:${PORT}`);
 });
-
