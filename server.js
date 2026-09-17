@@ -2,6 +2,7 @@ const express = require('express');
 const http = require('http');
 const { chromium } = require('playwright');
 const path = require('path');
+const fs = require('fs'); // File system added
 
 const app = express();
 const server = http.createServer(app);
@@ -191,6 +192,7 @@ app.post('/api/start', async (req, res) => {
         taskId,
         isRunning: true,
         logs: [`[${new Date().toLocaleTimeString()}] Task Initialized. ID: ${taskId}`],
+        browser: null,
         context: null
     };
 
@@ -205,16 +207,12 @@ async function runPlaywrightBot(taskId, cookiesStr, threadId, e2eePin, prefix, m
     const task = activeTasks.get(taskId);
     if (!task) return;
 
-    const sessionDir = path.join(__dirname, 'sessions', taskId);
-
     try {
         task.logs.push(`[${new Date().toLocaleTimeString()}] Launching Browser Engine...`);
         
-        // Linux/Cloud environments mein Chromium crash hone se rokne ke liye flags add kiye gaye hain
-        const context = await chromium.launchPersistentContext(sessionDir, {
+        // Standard launch with stable Linux flags
+        const browser = await chromium.launch({
             headless: true,
-            viewport: { width: 1280, height: 720 },
-            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
@@ -226,12 +224,19 @@ async function runPlaywrightBot(taskId, cookiesStr, threadId, e2eePin, prefix, m
             ]
         });
 
+        task.browser = browser;
+
+        const context = await browser.newContext({
+            viewport: { width: 1280, height: 720 },
+            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+        });
+
         task.context = context;
 
         const parsedCookies = parseCookies(cookiesStr);
         await context.addCookies(parsedCookies);
 
-        const page = context.pages().length > 0 ? context.pages()[0] : await context.newPage();
+        const page = await context.newPage();
 
         task.logs.push(`[${new Date().toLocaleTimeString()}] Navigating to Target Thread: ${threadId}`);
         await page.goto(`https://www.messenger.com/t/${threadId}`, { waitUntil: 'domcontentloaded', timeout: 60000 });
@@ -247,10 +252,10 @@ async function runPlaywrightBot(taskId, cookiesStr, threadId, e2eePin, prefix, m
                     await pinInput.fill(e2eePin);
                     await page.keyboard.press('Enter');
                     task.logs.push(`[INFO] PIN submitted. Waiting for chat unlock...`);
-                    await page.waitForTimeout(5000); // Encryption key unlock hone ka wait
+                    await page.waitForTimeout(5000);
                 }
             } catch (pErr) {
-                // PIN Prompt nahi aaya, continuous flow
+                // PIN Prompt nahi aaya
             }
         }
 
@@ -288,8 +293,8 @@ async function runPlaywrightBot(taskId, cookiesStr, threadId, e2eePin, prefix, m
     } catch (err) {
         task.logs.push(`[FATAL ERROR] ${err.message}`);
     } finally {
-        if (task.context) {
-            await task.context.close().catch(() => {});
+        if (task.browser) {
+            await task.browser.close().catch(() => {});
         }
         task.isRunning = false;
     }
@@ -310,8 +315,8 @@ app.post('/api/stop', async (req, res) => {
     }
 
     task.isRunning = false;
-    if (task.context) {
-        await task.context.close().catch(() => {});
+    if (task.browser) {
+        await task.browser.close().catch(() => {});
     }
 
     task.logs.push(`[${new Date().toLocaleTimeString()}] Stop signal received. Task terminated.`);
@@ -322,4 +327,3 @@ const PORT = process.env.PORT || 8080;
 server.listen(PORT, () => {
     console.log(`Server live on http://localhost:${PORT}`);
 });
-
