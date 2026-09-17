@@ -12,13 +12,10 @@ app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 process.on('unhandledRejection', (err) => {
     console.log('[UNHANDLED REJECTION]', err?.message || err);
 });
-
 process.on('uncaughtException', (err) => {
     console.log('[UNCAUGHT EXCEPTION]', err?.message || err);
 });
-
 process.on('SIGTERM', async () => {
-    console.log('SIGTERM received, cleaning up...');
     for (const [id, t] of activeTasks.entries()) {
         t.isRunning = false;
         if (t.context) await t.context.close().catch(() => {});
@@ -45,28 +42,8 @@ async function getBrowser() {
             '--disable-setuid-sandbox',
             '--disable-dev-shm-usage',
             '--disable-accelerated-2d-canvas',
-            '--disable-gpu',
             '--no-first-run',
-            '--disable-blink-features=AutomationControlled',
-            '--disable-features=IsolateOrigins,site-per-process',
-            '--disable-background-networking',
-            '--disable-background-timer-throttling',
-            '--disable-breakpad',
-            '--disable-component-update',
-            '--disable-default-apps',
-            '--disable-extensions',
-            '--disable-hang-monitor',
-            '--disable-popup-blocking',
-            '--disable-prompt-on-repost',
-            '--disable-renderer-backgrounding',
-            '--disable-sync',
-            '--metrics-recording-only',
-            '--mute-audio',
-            '--no-default-browser-check',
-            '--no-pings',
-            '--password-store=basic',
-            '--use-mock-keychain',
-            '--memory-pressure-off'
+            '--disable-gpu'
         ]
     });
     
@@ -78,124 +55,24 @@ async function getBrowser() {
     return GLOBAL_BROWSER;
 }
 
-// ================== ACTIVE TASKS ==================
 const activeTasks = new Map();
 const sleep = (sec) => new Promise((resolve) => setTimeout(resolve, sec * 1000));
 
 // ================== COOKIE PARSER ==================
 function parseCookies(cookieStr) {
-    const result = [];
-    const seen = new Set();
-    
-    cookieStr.split(';').forEach(pair => {
+    return cookieStr.split(';').map(pair => {
         const [name, ...rest] = pair.trim().split('=');
-        if (!name || rest.length === 0) return;
-        const value = rest.join('=').trim();
-        const cookieName = name.trim();
-        
-        ['.facebook.com', '.messenger.com'].forEach(domain => {
-            const key = `${cookieName}|${domain}`;
-            if (seen.has(key)) return;
-            seen.add(key);
-            result.push({
-                name: cookieName,
-                value: value,
-                domain: domain,
-                path: '/',
-                httpOnly: false,
-                secure: true,
-                sameSite: 'None'
-            });
-        });
-    });
-    
-    return result;
-}
-
-// ================== HELPERS ==================
-async function findInputBox(page, timeout = 10000) {
-    const selectors = [
-        'div[contenteditable="true"][data-lexical-editor="true"]',
-        'div[role="textbox"][contenteditable="true"]',
-        'div[contenteditable="true"][aria-label*="Message"]',
-        'div[aria-label="Message"][contenteditable="true"]',
-        'div[contenteditable="true"]'
-    ];
-    
-    for (const sel of selectors) {
-        try {
-            await page.waitForSelector(sel, { timeout: timeout / selectors.length });
-            return sel;
-        } catch (e) {}
-    }
-    return null;
-}
-
-async function isSessionAlive(page) {
-    try {
-        const url = page.url();
-        if (url.includes('/login') || url.includes('checkpoint') || url.includes('/recover')) {
-            return false;
-        }
-        const input = await page.$('div[contenteditable="true"]');
-        return !!input;
-    } catch (e) {
-        return false;
-    }
-}
-
-// ================== SESSION SETUP (BROWSER RESTART KE LIYE REUSABLE) ==================
-async function setupSession(cookiesStr, threadId, e2eePin, addLog) {
-    const browser = await getBrowser();
-    
-    const context = await browser.newContext({
-        viewport: { width: 800, height: 600 },
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        locale: 'en-US',
-        timezoneId: 'Asia/Kolkata'
-    });
-    
-    await context.addInitScript(() => {
-        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        window.chrome = { runtime: {} };
-    });
-    
-    await context.addCookies(parseCookies(cookiesStr));
-    const page = await context.newPage();
-    
-    addLog(`Navigating to Thread: ${threadId}`);
-    await page.goto(`https://www.messenger.com/t/${threadId}`, { 
-        waitUntil: 'domcontentloaded', 
-        timeout: 90000 
-    });
-    await page.waitForTimeout(5000);
-    
-    // E2EE PIN
-    if (e2eePin) {
-        try {
-            const pinInput = await page.waitForSelector(
-                'input[type="password"], input[aria-label*="PIN"]', 
-                { timeout: 8000 }
-            ).catch(() => null);
-            
-            if (pinInput) {
-                addLog(`E2EE PIN prompt detected.`);
-                await pinInput.fill(e2eePin);
-                await page.keyboard.press('Enter');
-                await page.waitForTimeout(6000);
-            }
-        } catch (pErr) {}
-    }
-    
-    addLog(`Searching for input box...`);
-    const inputSelector = await findInputBox(page, 15000);
-    
-    if (!inputSelector) {
-        await context.close().catch(() => {});
-        throw new Error('Chat input box not found. Cookies ya Thread ID check karo.');
-    }
-    
-    return { browser, context, page, inputSelector };
+        if (!name || rest.length === 0) return null;
+        return {
+            name: name.trim(),
+            value: rest.join('=').trim(),
+            domain: '.messenger.com',
+            path: '/',
+            httpOnly: false,
+            secure: true,
+            sameSite: 'Lax'
+        };
+    }).filter(Boolean);
 }
 
 // ================== DASHBOARD UI ==================
@@ -218,24 +95,20 @@ app.get('/', (req, res) => {
         input:focus, textarea:focus { border-color: #ec4899; outline: none; background: #fff; box-shadow: 0 0 0 3px rgba(236, 72, 153, 0.1); }
         textarea { height: 90px; resize: vertical; }
         .btn-start { background: linear-gradient(135deg, #ec4899 0%, #db2777 100%); color: white; width: 100%; margin-top: 25px; padding: 14px; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; font-size: 16px; box-shadow: 0 4px 12px rgba(219, 39, 119, 0.3); }
-        .btn-start:hover { opacity: 0.95; }
         .btn-stop { background: #ef4444; color: white; padding: 12px 20px; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; white-space: nowrap; }
-        .btn-stop:hover { background: #dc2626; }
         .btn-view { background: #8b5cf6; color: white; padding: 12px 20px; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; white-space: nowrap; }
-        .btn-view:hover { background: #7c3aed; }
         .row { display: flex; gap: 10px; align-items: flex-end; margin-top: 10px; }
         .row input { margin-top: 0; }
         .monitor-card { margin-top: 25px; padding: 20px; background: linear-gradient(135deg, #fdf2f8 0%, #ffffff 100%); border: 2px solid #fbcfe8; border-radius: 12px; }
         .monitor-card h3 { color: #db2777; margin: 0 0 15px 0; font-size: 16px; }
         .stats-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 15px; }
         .stat-box { background: #fff; padding: 12px; border-radius: 8px; border: 1px solid #fbcfe8; }
-        .stat-label { font-size: 11px; color: #6b7280; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
+        .stat-label { font-size: 11px; color: #6b7280; font-weight: 600; text-transform: uppercase; }
         .stat-value { font-size: 18px; color: #db2777; font-weight: bold; margin-top: 4px; font-family: monospace; }
         #logBox { background: #111827; padding: 15px; height: 250px; overflow-y: auto; border-radius: 8px; font-family: monospace; font-size: 12px; border: 1px solid #374151; color: #4ade80; }
         #logBox .err { color: #f87171; }
         #logBox .warn { color: #fbbf24; }
         .divider { margin: 25px 0; border-top: 2px dashed #f3f4f6; }
-        .hint { font-size: 12px; color: #9ca3af; margin-top: 6px; }
     </style>
 </head>
 <body>
@@ -247,12 +120,12 @@ app.get('/', (req, res) => {
             <label>Messenger Cookie String:</label>
             <textarea id="cookies" placeholder="c_user=...; xs=...; datr=...;" required></textarea>
             <label>Target UID / Thread ID:</label>
-            <input type="text" id="threadId" placeholder="e.g. 1000XXXXXXXXX" required>
+            <input type="text" id="threadId" placeholder="e.g. 1000XXXXXXXXX or Group ID" required>
             <label>E2EE 6-Digit PIN (Optional):</label>
             <input type="password" id="e2eePin" placeholder="e.g. 123456">
             <label>Message Prefix (Optional):</label>
             <input type="text" id="prefix" placeholder="e.g. [RAJ]">
-            <label>Messages (.txt File):</label>
+            <label>Messages (.txt File Choose Karein):</label>
             <input type="file" id="msgFile" accept=".txt" required>
             <label>Delay (In Seconds):</label>
             <input type="number" id="delay" value="30" min="5" required>
@@ -334,7 +207,7 @@ app.get('/', (req, res) => {
             startedAt = null;
             document.getElementById('statusBadge').innerHTML = '—';
             document.getElementById('uptime').innerHTML = '—';
-            document.getElementById('logBox').innerHTML = 'Loading logs...';
+            document.getElementById('logBox').innerHTML = 'Loading...';
             
             if (pollInterval) clearInterval(pollInterval);
             fetchStatus();
@@ -413,7 +286,7 @@ app.post('/api/start', async (req, res) => {
     const taskData = {
         taskId,
         isRunning: true,
-        startedAt: Date.now(),  // UPTIME KE LIYE
+        startedAt: Date.now(),
         logs: [`[${new Date().toLocaleTimeString()}] Task Initialized. ID: ${taskId}`],
         context: null
     };
@@ -432,6 +305,77 @@ app.post('/api/start', async (req, res) => {
 
     res.json({ success: true, taskId });
 });
+
+// ================== SESSION SETUP (TUMHARA WORKING LOGIC) ==================
+async function setupSession(cookiesStr, threadId, e2eePin, addLog) {
+    const browser = await getBrowser();
+    
+    const context = await browser.newContext({
+        viewport: { width: 1280, height: 720 },
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+    });
+
+    const parsedCookies = parseCookies(cookiesStr);
+    await context.addCookies(parsedCookies);
+
+    const page = await context.newPage();
+
+    addLog(`Navigating to Target Thread: ${threadId}`);
+    await page.goto(`https://www.messenger.com/t/${threadId}`, { 
+        waitUntil: 'domcontentloaded', 
+        timeout: 60000 
+    });
+
+    // ===== E2EE PIN HANDLING (TUMHARA ORIGINAL - WORKING) =====
+    if (e2eePin) {
+        try {
+            const pinSelector = 'input[type="password"], input[aria-label*="PIN"], input[placeholder*="PIN"]';
+            const pinInput = await page.waitForSelector(pinSelector, { timeout: 8000 }).catch(() => null);
+            
+            if (pinInput) {
+                addLog(`E2EE PIN Prompt detected. Entering PIN...`);
+                await pinInput.click();
+                await pinInput.fill(e2eePin);
+                await page.keyboard.press('Enter');
+
+                const submitBtn = await page.$('button[type="submit"], div[role="button"]:has-text("Continue"), div[role="button"]:has-text("Submit")').catch(() => null);
+                if (submitBtn) await submitBtn.click();
+
+                addLog(`PIN submitted. Waiting for chat unlock...`);
+                await page.waitForTimeout(6000);
+            }
+        } catch (pErr) {
+            addLog(`PIN Handling Warning: ${pErr.message}`);
+        }
+    }
+
+    // ===== CHAT INPUT SELECTOR (TUMHARA ORIGINAL) =====
+    const possibleSelectors = [
+        'div[role="textbox"][contenteditable="true"]',
+        'div[contenteditable="true"][aria-label*="Message"]',
+        'div[contenteditable="true"]',
+        'div[aria-label="Message"]',
+        'div[role="textbox"]'
+    ];
+
+    let inputSelector = null;
+    addLog(`Searching for chat input box...`);
+
+    for (const selector of possibleSelectors) {
+        try {
+            await page.waitForSelector(selector, { timeout: 6000 });
+            inputSelector = selector;
+            break;
+        } catch (e) {}
+    }
+
+    if (!inputSelector) {
+        await context.close().catch(() => {});
+        throw new Error(`Chat input box not found. Check cookies or target ID.`);
+    }
+
+    return { browser, context, page, inputSelector };
+}
 
 // ================== MAIN BOT ==================
 async function runPlaywrightBot(taskId, cookiesStr, threadId, e2eePin, prefix, messages, delay) {
@@ -456,29 +400,25 @@ async function runPlaywrightBot(taskId, cookiesStr, threadId, e2eePin, prefix, m
         page = session.page;
         inputSelector = session.inputSelector;
         task.context = context;
-        
-        addLog(`✅ Connected. Starting loop...`);
-        addLog(`⏰ Auto browser restart har 8 ghante me hoga.`);
+
+        addLog(`Connected to Chat successfully. Starting loop...`);
+        addLog(`⏰ Browser auto-restart har 8 ghante me hoga.`);
 
         let index = 0;
         let msgCount = 0;
 
         while (task.isRunning) {
             
-            // ========== 8 HOUR BROWSER RESTART ==========
+            // ========== 8 HOUR AUTO RESTART ==========
             if (Date.now() - lastRestart >= BROWSER_RESTART_INTERVAL) {
-                addLog(`🔄 8 ghante complete. Browser restart kar raha hoon...`);
+                addLog(`🔄 8 ghante complete. Browser restart...`);
                 
-                // Purana context band
                 try { await context.close(); } catch(e) {}
-                
-                // Global browser bhi reset (fresh Chromium)
                 if (GLOBAL_BROWSER) {
                     try { await GLOBAL_BROWSER.close(); } catch(e) {}
                     GLOBAL_BROWSER = null;
                 }
                 
-                // Naya session setup
                 try {
                     const newSession = await setupSession(cookiesStr, threadId, e2eePin, addLog);
                     context = newSession.context;
@@ -488,26 +428,16 @@ async function runPlaywrightBot(taskId, cookiesStr, threadId, e2eePin, prefix, m
                     lastRestart = Date.now();
                     addLog(`✅ Browser restart successful. Loop continue.`);
                 } catch (rErr) {
-                    addLog(`❌ Browser restart fail: ${rErr.message}. Task stop.`);
+                    addLog(`❌ Restart fail: ${rErr.message}. Task stop.`);
                     task.isRunning = false;
                     break;
                 }
             }
             
             // ========== HEALTH CHECK ==========
-            if (!page || page.isClosed() || !context) {
-                addLog(`❌ Page/Context dead. Stopping.`);
+            if (!page || page.isClosed()) {
+                addLog(`❌ Page closed. Stopping.`);
                 break;
-            }
-            
-            // ========== SESSION CHECK har 5 msg ==========
-            if (msgCount > 0 && msgCount % 5 === 0) {
-                const alive = await isSessionAlive(page);
-                if (!alive) {
-                    addLog(`⚠️ Session expired. Stopping.`);
-                    task.isRunning = false;
-                    break;
-                }
             }
 
             const rawMsg = messages[index];
@@ -524,38 +454,28 @@ async function runPlaywrightBot(taskId, cookiesStr, threadId, e2eePin, prefix, m
                     }
                 }, { selector: inputSelector, text: finalPayload });
 
-                await page.waitForTimeout(300);
+                await page.waitForTimeout(200);
                 await page.keyboard.press('Enter');
-                await page.waitForTimeout(1000);
 
-                const stillThere = await page.evaluate((sel) => {
-                    const el = document.querySelector(sel);
-                    return el ? el.innerText.trim().length : -1;
-                }, inputSelector).catch(() => -1);
-
-                if (stillThere === -1) {
-                    throw new Error('Input box lost');
-                } else if (stillThere > 0) {
-                    await page.keyboard.press('Enter');
-                    await page.waitForTimeout(800);
-                    addLog(`✅ Sent (retry): "${finalPayload.substring(0, 40)}"`);
-                } else {
-                    addLog(`✅ Sent: "${finalPayload.substring(0, 40)}"`);
-                }
-
+                addLog(`Message Sent: "${finalPayload.substring(0, 50)}"`);
             } catch (err) {
                 addLog(`⚠️ Send Error: ${err.message}`);
                 
-                if (err.message.includes('Input box') || err.message.includes('Target closed')) {
+                // Input box kho gaya - reload
+                if (err.message.includes('Target closed') || err.message.includes('evaluate')) {
                     try {
                         addLog(`🔄 Reloading...`);
                         await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 });
                         await page.waitForTimeout(5000);
-                        inputSelector = await findInputBox(page, 10000);
-                        if (!inputSelector) {
-                            addLog(`❌ Input box nahi mila. Stopping.`);
-                            break;
+                        
+                        for (const selector of ['div[role="textbox"][contenteditable="true"]', 'div[contenteditable="true"]']) {
+                            try {
+                                await page.waitForSelector(selector, { timeout: 6000 });
+                                inputSelector = selector;
+                                break;
+                            } catch (e) {}
                         }
+                        if (!inputSelector) break;
                         continue;
                     } catch (rErr) {
                         addLog(`❌ Reload fail. Stopping.`);
@@ -567,16 +487,19 @@ async function runPlaywrightBot(taskId, cookiesStr, threadId, e2eePin, prefix, m
             index = (index + 1) % messages.length;
             msgCount++;
 
-            // ========== MEMORY CLEANUP har 60 msg ==========
+            // ========== MEMORY CLEANUP - HAR 60 MSG ==========
             if (msgCount > 0 && msgCount % 60 === 0) {
                 addLog(`🔄 Memory cleanup - reload (msg #${msgCount})...`);
                 try {
                     await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 });
                     await page.waitForTimeout(5000);
-                    inputSelector = await findInputBox(page, 10000);
-                    if (!inputSelector) {
-                        addLog(`❌ Reload ke baad input box nahi mila. Stopping.`);
-                        break;
+                    
+                    for (const selector of ['div[role="textbox"][contenteditable="true"]', 'div[contenteditable="true"]']) {
+                        try {
+                            await page.waitForSelector(selector, { timeout: 6000 });
+                            inputSelector = selector;
+                            break;
+                        } catch (e) {}
                     }
                     addLog(`✅ Memory cleaned.`);
                 } catch (rErr) {
@@ -591,11 +514,10 @@ async function runPlaywrightBot(taskId, cookiesStr, threadId, e2eePin, prefix, m
             }
         }
 
-        addLog(`Task loop ended.`);
+        addLog(`Task Loop Terminated.`);
 
     } catch (err) {
-        addLog(`[FATAL] ${err.message}`);
-        console.log('[BOT ERROR]', err.message);
+        addLog(`FATAL ERROR: ${err.message}`);
     } finally {
         task.isRunning = false;
         try {
@@ -604,7 +526,7 @@ async function runPlaywrightBot(taskId, cookiesStr, threadId, e2eePin, prefix, m
     }
 }
 
-// ================== STATUS API (UPTIME + LOGS) ==================
+// ================== STATUS API ==================
 app.get('/api/status/:taskId', (req, res) => {
     const task = activeTasks.get(req.params.taskId);
     if (!task) return res.json({ found: false });
@@ -615,6 +537,13 @@ app.get('/api/status/:taskId', (req, res) => {
         startedAt: task.startedAt,
         logs: task.logs || []
     });
+});
+
+// ================== LOGS API (purana support) ==================
+app.get('/api/logs/:taskId', (req, res) => {
+    const task = activeTasks.get(req.params.taskId);
+    if (!task) return res.json({ logs: ["Task not found or expired."] });
+    res.json({ logs: task.logs });
 });
 
 // ================== STOP API ==================
@@ -636,7 +565,6 @@ app.get('/health', (req, res) => {
         status: 'ok',
         uptime: Math.round(process.uptime()) + 's',
         ram_mb: Math.round(mem.rss / 1024 / 1024),
-        heap_mb: Math.round(mem.heapUsed / 1024 / 1024),
         active_tasks: Array.from(activeTasks.keys()).filter(k => activeTasks.get(k).isRunning),
         browser_alive: GLOBAL_BROWSER?.isConnected() || false
     });
