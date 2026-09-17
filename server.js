@@ -210,10 +210,20 @@ async function runPlaywrightBot(taskId, cookiesStr, threadId, e2eePin, prefix, m
     try {
         task.logs.push(`[${new Date().toLocaleTimeString()}] Launching Browser Engine...`);
         
+        // Linux/Cloud environments mein Chromium crash hone se rokne ke liye flags add kiye gaye hain
         const context = await chromium.launchPersistentContext(sessionDir, {
             headless: true,
             viewport: { width: 1280, height: 720 },
-            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-accelerated-2d-canvas',
+                '--no-first-run',
+                '--no-zygote',
+                '--disable-gpu'
+            ]
         });
 
         task.context = context;
@@ -312,3 +322,4 @@ const PORT = process.env.PORT || 8080;
 server.listen(PORT, () => {
     console.log(`Server live on http://localhost:${PORT}`);
 });
+
