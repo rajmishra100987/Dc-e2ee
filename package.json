@@ -1,0 +1,17 @@
+{
+  "name": "messenger-e2ee-bot",
+  "version": "1.0.0",
+  "description": "Messenger.com Playwright E2EE Automation Dashboard",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "postinstall": "npx playwright install chromium --with-deps"
+  },
+  "dependencies": {
+    "express": "latest",
+    "playwright": "latest"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
