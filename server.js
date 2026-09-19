@@ -11,58 +11,153 @@ const server = http.createServer(app);
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 
-// ================== TASKS FILE (VOLUME ME SAVE HOGA) ==================
+// ================== DATA DIR ==================
 const DATA_DIR = '/app/data';
 const TASKS_FILE = path.join(DATA_DIR, 'tasks.json');
 
 try {
-    if (!fs.existsSync(DATA_DIR)) {
-        fs.mkdirSync(DATA_DIR, { recursive: true });
-        console.log(`✅ Data directory created: ${DATA_DIR}`);
-    } else {
-        console.log(`✅ Data directory exists: ${DATA_DIR}`);
-    }
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    console.log(`✅ Data dir: ${DATA_DIR}`);
 } catch (e) {
     console.log(`⚠️ Data dir error: ${e.message}`);
 }
 
 // ================== CRASH PREVENTION ==================
 process.on('unhandledRejection', (err) => {
-    console.log('[UNHANDLED REJECTION]', err?.message || err);
+    console.log('[UNHANDLED]', err?.message || err);
 });
-
 process.on('uncaughtException', (err) => {
-    console.log('[UNCAUGHT EXCEPTION]', err?.message || err);
+    console.log('[UNCAUGHT]', err?.message || err);
 });
-
 process.on('SIGTERM', async () => {
     console.log('⚠️ SIGTERM received. Saving tasks...');
     try { saveTasksToDisk(); } catch (e) {}
     for (const [id, t] of activeTasks.entries()) {
         t.isRunning = false;
-        if (t.context) await t.context.close().catch(() => {});
+        if (t.context) await safeCloseContext(t.context);
     }
     process.exit(0);
 });
-
 process.on('SIGINT', async () => {
-    console.log('⚠️ SIGINT received. Saving tasks...');
     try { saveTasksToDisk(); } catch (e) {}
     process.exit(0);
 });
 
 // ================== CONFIG ==================
-const BROWSER_RESTART_INTERVAL = 6 * 60 * 60 * 1000;   // 6 hours
+const BROWSER_RESTART_INTERVAL = 8 * 60 * 60 * 1000;   // 8 hours
 const PAGE_RELOAD_EVERY = 30;                           // 30 messages
-const MEMORY_LIMIT_MB = 750;                            // Browser restart threshold
-const CONTEXT_CLOSE_TIMEOUT = 15000;                    // 15 sec
-const BROWSER_LAUNCH_TIMEOUT = 45000;                   // 45 sec
-const RESTART_MAX_RETRIES = 5;                          // 5 attempts
-const RESTART_RETRY_DELAY = 10000;                      // 10 sec between retries
+const MEMORY_LIMIT_MB = 800;
+const CONTEXT_CLOSE_TIMEOUT = 20000;
+const BROWSER_LAUNCH_TIMEOUT = 60000;
+const RESTART_MAX_RETRIES = 5;
+const RESTART_RETRY_DELAY = 10000;
+const SESSION_CHECK_EVERY = 3;                          // Check session every 3 messages
+const WATCHDOG_TIMEOUT = 15 * 60 * 1000;                // 15 min no send = restart
+const RELOGIN_MAX_RETRIES = 3;                          // Max re-login attempts
+const NETWORK_RETRY_ATTEMPTS = 5;                       // Network retry
 
 // ================== ACTIVE TASKS ==================
 const activeTasks = new Map();
 const sleep = (sec) => new Promise((resolve) => setTimeout(resolve, sec * 1000));
+
+// ================== HELPERS ==================
+function parseCookies(cookieStr) {
+    const result = [];
+    const seen = new Set();
+    
+    cookieStr.split(';').forEach(pair => {
+        const [name, ...rest] = pair.trim().split('=');
+        if (!name || rest.length === 0) return;
+        const value = rest.join('=').trim();
+        const cookieName = name.trim();
+        
+        ['.facebook.com', '.messenger.com'].forEach(domain => {
+            const key = `${cookieName}|${domain}`;
+            if (seen.has(key)) return;
+            seen.add(key);
+            result.push({
+                name: cookieName,
+                value: value,
+                domain: domain,
+                path: '/',
+                httpOnly: false,
+                secure: true,
+                sameSite: 'Lax'
+            });
+        });
+    });
+    
+    return result;
+}
+
+function killZombieChromium() {
+    try {
+        execSync('pkill -9 -f "chrome|chromium" || true', { stdio: 'ignore' });
+        console.log('🧹 Zombie Chromium killed');
+    } catch(e) {}
+}
+
+async function safeCloseContext(context) {
+    if (!context) return;
+    try {
+        await Promise.race([
+            context.close(),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('close timeout')), CONTEXT_CLOSE_TIMEOUT))
+        ]);
+    } catch(e) {
+        console.log('Context close error:', e.message);
+    }
+}
+
+// ================== SESSION ALIVE CHECK (CRITICAL) ==================
+async function isSessionAlive(page) {
+    try {
+        // 1. Page band ho gaya?
+        if (!page || page.isClosed()) {
+            return { alive: false, reason: 'Page closed' };
+        }
+        
+        // 2. URL check
+        const url = page.url();
+        if (url.includes('/login') || url.includes('checkpoint') || 
+            url.includes('/recover') || url.includes('/help/contact')) {
+            return { alive: false, reason: `URL redirect: ${url}` };
+        }
+        
+        // 3. Title check
+        const title = await page.title().catch(() => '');
+        const titleLower = title.toLowerCase();
+        if (titleLower.includes('log in') || titleLower.includes('sign in') || 
+            titleLower.includes('login') || titleLower.includes('facebook')) {
+            // Facebook title normal bhi "Messenger" hota hai, so check karo
+            if (titleLower !== 'messenger' && titleLower !== '(1) messenger') {
+                return { alive: false, reason: `Login title: ${title}` };
+            }
+        }
+        
+        // 4. Input box exist karta hai?
+        const inputBox = await page.$('div[contenteditable="true"][role="textbox"], div[contenteditable="true"]').catch(() => null);
+        if (!inputBox) {
+            return { alive: false, reason: 'Input box missing' };
+        }
+        
+        // 5. "Log in" button check
+        const loginBtn = await page.$('button:has-text("Log in"), a:has-text("Log in"), div[role="button"]:has-text("Log in")').catch(() => null);
+        if (loginBtn) {
+            return { alive: false, reason: 'Login button detected' };
+        }
+        
+        // 6. Password field check
+        const pwdField = await page.$('input[type="password"]').catch(() => null);
+        if (pwdField) {
+            return { alive: false, reason: 'Password field detected' };
+        }
+        
+        return { alive: true };
+    } catch (e) {
+        return { alive: false, reason: `Check error: ${e.message}` };
+    }
+}
 
 // ================== SAVE / LOAD TASKS ==================
 function saveTasksToDisk() {
@@ -88,7 +183,6 @@ async function loadTasksFromDisk() {
             console.log('📂 No saved tasks. Fresh start.');
             return;
         }
-        
         const fileContent = fs.readFileSync(TASKS_FILE, 'utf8');
         if (!fileContent.trim()) return;
         
@@ -103,7 +197,6 @@ async function loadTasksFromDisk() {
         
         for (const [taskId, data] of Object.entries(tasksData)) {
             console.log(`🚀 Resuming: ${taskId}`);
-            
             const taskData = {
                 taskId,
                 isRunning: true,
@@ -112,10 +205,8 @@ async function loadTasksFromDisk() {
                 context: null,
                 originalData: data
             };
-            
             activeTasks.set(taskId, taskData);
             await sleep(2);
-            
             runPlaywrightBot(taskId, data.cookies, data.threadId, data.e2eePin, data.prefix, data.messages, data.delay)
                 .catch(err => {
                     console.log(`[CRASH ${taskId}]`, err.message);
@@ -126,27 +217,57 @@ async function loadTasksFromDisk() {
                     }
                 });
         }
-        
         console.log('✅ Auto-resume complete.');
     } catch (e) {
         console.log('❌ Load error:', e.message);
     }
 }
 
-// ================== ZOMBIE CLEANUP ==================
-function killZombieChromium() {
+// ================== PERSISTENT BROWSER LAUNCH ==================
+async function launchPersistentBrowser(taskId, cookiesStr, addLog, forceFresh = false) {
+    const userDataDir = path.join(DATA_DIR, `browser-profile-${taskId}`);
+    const backupDir = path.join(DATA_DIR, `browser-profile-${taskId}-backup`);
+    
+    let isFreshProfile = true;
     try {
-        execSync('pkill -9 -f "chrome|chromium" || true', { stdio: 'ignore' });
-        console.log('🧹 Zombie Chromium killed');
+        if (fs.existsSync(userDataDir) && !forceFresh) {
+            const files = fs.readdirSync(userDataDir);
+            if (files.includes('Default') || files.includes('Local State')) {
+                isFreshProfile = false;
+            }
+        }
     } catch(e) {}
-}
-
-// ================== BROWSER (WITH TIMEOUT + RETRY) ==================
-let GLOBAL_BROWSER = null;
-
-async function launchBrowserWithTimeout() {
-    const launchPromise = chromium.launch({
+    
+    // If forced fresh, delete old profile
+    if (forceFresh && fs.existsSync(userDataDir)) {
+        try {
+            fs.rmSync(userDataDir, { recursive: true, force: true });
+            addLog(`🗑️ Old profile deleted (force fresh)`);
+        } catch(e) {}
+    }
+    
+    if (isFreshProfile) {
+        addLog(`🆕 Fresh browser profile. Cookies inject ho rahi hain...`);
+    } else {
+        addLog(`🔄 Existing profile. Saved session use hoga.`);
+    }
+    
+    // Backup existing profile before launching (safety)
+    if (!isFreshProfile && fs.existsSync(userDataDir)) {
+        try {
+            if (fs.existsSync(backupDir)) fs.rmSync(backupDir, { recursive: true, force: true });
+            execSync(`cp -r "${userDataDir}" "${backupDir}"`, { stdio: 'ignore' });
+        } catch(e) {}
+    }
+    
+    const launchPromise = chromium.launchPersistentContext(userDataDir, {
         headless: true,
+        viewport: { width: 1280, height: 720 },
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        locale: 'en-US',
+        timezoneId: 'Asia/Kolkata',
+        acceptDownloads: false,
+        ignoreHTTPSErrors: true,
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
@@ -176,65 +297,31 @@ async function launchBrowserWithTimeout() {
         ]
     });
     
-    const timeoutPromise = new Promise((_, reject) => {
-        setTimeout(() => reject(new Error('Browser launch timeout')), BROWSER_LAUNCH_TIMEOUT);
+    const timeoutPromise = new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('Browser launch timeout')), BROWSER_LAUNCH_TIMEOUT)
+    );
+    
+    const context = await Promise.race([launchPromise, timeoutPromise]);
+    
+    // Stealth patches
+    await context.addInitScript(() => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        window.chrome = { runtime: {} };
+        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
     });
     
-    return await Promise.race([launchPromise, timeoutPromise]);
-}
-
-async function getBrowser() {
-    if (GLOBAL_BROWSER && GLOBAL_BROWSER.isConnected()) {
-        return GLOBAL_BROWSER;
+    if (isFreshProfile) {
+        await context.addCookies(parseCookies(cookiesStr));
+        addLog(`✅ Cookies injected (${parseCookies(cookiesStr).length} cookies)`);
+    } else {
+        addLog(`✅ Saved session loaded from profile`);
     }
     
-    console.log('Launching fresh Chromium...');
-    
-    // Zombie cleanup before launch
-    killZombieChromium();
-    await sleep(2);
-    
-    GLOBAL_BROWSER = await launchBrowserWithTimeout();
-    
-    GLOBAL_BROWSER.on('disconnected', () => {
-        console.log('⚠️ Global browser disconnected!');
-        GLOBAL_BROWSER = null;
-    });
-    
-    return GLOBAL_BROWSER;
+    return { context, isFreshProfile };
 }
 
-// ================== COOKIE PARSER ==================
-function parseCookies(cookieStr) {
-    return cookieStr.split(';').map(pair => {
-        const [name, ...rest] = pair.trim().split('=');
-        if (!name || rest.length === 0) return null;
-        return {
-            name: name.trim(),
-            value: rest.join('=').trim(),
-            domain: '.messenger.com',
-            path: '/',
-            httpOnly: false,
-            secure: true,
-            sameSite: 'Lax'
-        };
-    }).filter(Boolean);
-}
-
-// ================== SAFE CONTEXT CLOSE ==================
-async function safeCloseContext(context) {
-    if (!context) return;
-    try {
-        await Promise.race([
-            context.close(),
-            new Promise((_, reject) => setTimeout(() => reject(new Error('close timeout')), CONTEXT_CLOSE_TIMEOUT))
-        ]);
-    } catch(e) {
-        console.log('Context close timeout/error:', e.message);
-    }
-}
-
-// ================== DASHBOARD UI ==================
+// ================== DASHBOARD UI (Same as before, keeping it) ==================
 app.get('/', (req, res) => {
     res.send(`
 <!DOCTYPE html>
@@ -281,10 +368,7 @@ app.get('/', (req, res) => {
     <div class="container">
         <h2>Messenger Automation Bot</h2>
         <div class="developer-tag">DEVELOPED BY : RAJ MISHRA</div>
-        
-        <div class="info-banner">
-            ♻️ Auto-Resume Enabled — Server restart ho to task khud chalega
-        </div>
+        <div class="info-banner">♻️ 24/7 Auto-Recovery — Persistent Profile + Session Check + Watchdog</div>
         
         <form id="botForm">
             <label>Messenger Cookie String:</label>
@@ -293,96 +377,55 @@ app.get('/', (req, res) => {
                 <button type="button" class="btn-check" id="checkBtn" onclick="checkCookies()">🔍 CHECK COOKIES</button>
             </div>
             <div id="cookieResult"></div>
-            
             <label>Target UID / Thread ID:</label>
             <input type="text" id="threadId" placeholder="e.g. 1000XXXXXXXXX" required>
             <label>E2EE 6-Digit PIN (Optional):</label>
             <input type="password" id="e2eePin" placeholder="e.g. 123456">
             <label>Message Prefix (Optional):</label>
             <input type="text" id="prefix" placeholder="e.g. [RAJ]">
-            <label>Messages (.txt File Choose Karein):</label>
+            <label>Messages (.txt File):</label>
             <input type="file" id="msgFile" accept=".txt" required>
             <label>Delay (In Seconds):</label>
             <input type="number" id="delay" value="30" min="5" required>
             <button type="button" class="btn-start" onclick="startTask()">START TASK</button>
         </form>
-
         <div class="divider"></div>
-
         <div class="monitor-card">
             <h3>📊 Task Monitor</h3>
-            <label>Task ID (live logs + uptime):</label>
+            <label>Task ID:</label>
             <div class="row">
                 <input type="text" id="monitorTaskId" placeholder="e.g. TASK-123456">
                 <button type="button" class="btn-view" onclick="viewTask()">VIEW</button>
                 <button type="button" class="btn-stop" onclick="stopTask()">STOP</button>
             </div>
-
             <div class="stats-grid" style="margin-top: 15px;">
-                <div class="stat-box">
-                    <div class="stat-label">Status</div>
-                    <div class="stat-value" id="statusBadge">—</div>
-                </div>
-                <div class="stat-box">
-                    <div class="stat-label">Uptime</div>
-                    <div class="stat-value" id="uptime">—</div>
-                </div>
+                <div class="stat-box"><div class="stat-label">Status</div><div class="stat-value" id="statusBadge">—</div></div>
+                <div class="stat-box"><div class="stat-label">Uptime</div><div class="stat-value" id="uptime">—</div></div>
             </div>
-
             <div id="logBox">Waiting for task ID...</div>
         </div>
     </div>
-
     <script>
-        let monitorTaskId = null;
-        let pollInterval = null;
-        let startedAt = null;
-
-        function escapeHtml(s) {
-            return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-        }
-
+        let monitorTaskId = null, pollInterval = null, startedAt = null;
+        function escapeHtml(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
         async function checkCookies() {
             const cookies = document.getElementById('cookies').value.trim();
             const btn = document.getElementById('checkBtn');
             const resultDiv = document.getElementById('cookieResult');
-            
-            if (!cookies) {
-                resultDiv.innerHTML = '<div class="cookie-result-box invalid">❌ Pehle cookies daalo!</div>';
-                return;
-            }
-            
-            btn.disabled = true;
-            btn.innerHTML = '⏳ Checking...';
-            resultDiv.innerHTML = '<div class="cookie-result-box loading">🔄 Check ho raha hai... (10-15 sec)</div>';
-            
+            if (!cookies) { resultDiv.innerHTML = '<div class="cookie-result-box invalid">❌ Pehle cookies daalo!</div>'; return; }
+            btn.disabled = true; btn.innerHTML = '⏳ Checking...';
+            resultDiv.innerHTML = '<div class="cookie-result-box loading">🔄 Check ho raha hai...</div>';
             try {
-                const res = await fetch('/api/check-cookies', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ cookies })
-                });
+                const res = await fetch('/api/check-cookies', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cookies }) });
                 const data = await res.json();
-                
                 if (data.valid) {
-                    resultDiv.innerHTML = '<div class="cookie-result-box valid">✅ <b>Cookies Valid!</b><br>👤 User ID: <b>' + (data.user_id || 'N/A') + '</b><br>📛 Name: <b>' + (data.user_name || 'Unknown') + '</b><br>🍪 Cookies: <b>' + (data.cookie_count || 0) + '</b></div>';
+                    resultDiv.innerHTML = '<div class="cookie-result-box valid">✅ <b>Valid!</b><br>👤 ' + (data.user_id || 'N/A') + '<br>📛 ' + (data.user_name || 'Unknown') + '</div>';
                 } else {
-                    let extra = '';
-                    if (data.redirect_url) extra += '<br>🔄 ' + data.redirect_url;
-                    if (data.missing) {
-                        const m = Object.entries(data.missing).filter(([k,v]) => v).map(([k]) => k);
-                        if (m.length) extra += '<br>❌ Missing: ' + m.join(', ');
-                    }
-                    resultDiv.innerHTML = '<div class="cookie-result-box invalid">❌ <b>Invalid!</b><br>' + (data.error || '') + extra + '</div>';
+                    resultDiv.innerHTML = '<div class="cookie-result-box invalid">❌ <b>Invalid!</b><br>' + (data.error || '') + '</div>';
                 }
-            } catch (err) {
-                resultDiv.innerHTML = '<div class="cookie-result-box invalid">❌ Error: ' + err.message + '</div>';
-            } finally {
-                btn.disabled = false;
-                btn.innerHTML = '🔍 CHECK COOKIES';
-            }
+            } catch (err) { resultDiv.innerHTML = '<div class="cookie-result-box invalid">❌ ' + err.message + '</div>'; }
+            finally { btn.disabled = false; btn.innerHTML = '🔍 CHECK COOKIES'; }
         }
-
         async function startTask() {
             const cookies = document.getElementById('cookies').value.trim();
             const threadId = document.getElementById('threadId').value.trim();
@@ -390,62 +433,38 @@ app.get('/', (req, res) => {
             const prefix = document.getElementById('prefix').value;
             const delay = parseInt(document.getElementById('delay').value);
             const fileInput = document.getElementById('msgFile');
-
-            if (!cookies || !threadId || fileInput.files.length === 0) {
-                alert('Cookies, UID aur Message file bharein!');
-                return;
-            }
-
+            if (!cookies || !threadId || fileInput.files.length === 0) { alert('Sab fields bharein!'); return; }
             const text = await fileInput.files[0].text();
             const messages = text.split('\\n').map(m => m.trim()).filter(m => m.length > 0);
-            if (messages.length === 0) { alert('Message file khali hai!'); return; }
-
-            const response = await fetch('/api/start', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ cookies, threadId, e2eePin, prefix, messages, delay })
-            });
-
+            if (messages.length === 0) { alert('File khali hai!'); return; }
+            const response = await fetch('/api/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cookies, threadId, e2eePin, prefix, messages, delay }) });
             const data = await response.json();
-            if (data.success) {
-                document.getElementById('monitorTaskId').value = data.taskId;
-                viewTask();
-            } else {
-                alert("Task start nahi ho payi!");
-            }
+            if (data.success) { document.getElementById('monitorTaskId').value = data.taskId; viewTask(); }
+            else alert("Start fail!");
         }
-
         function viewTask() {
             const taskId = document.getElementById('monitorTaskId').value.trim();
             if (!taskId) { alert('Task ID daalein!'); return; }
-            
-            monitorTaskId = taskId;
-            startedAt = null;
+            monitorTaskId = taskId; startedAt = null;
             document.getElementById('statusBadge').innerHTML = '—';
             document.getElementById('uptime').innerHTML = '—';
             document.getElementById('logBox').innerHTML = 'Loading...';
-            
             if (pollInterval) clearInterval(pollInterval);
             fetchStatus();
             pollInterval = setInterval(fetchStatus, 2000);
         }
-
         async function fetchStatus() {
             if (!monitorTaskId) return;
             try {
                 const res = await fetch('/api/status/' + monitorTaskId);
                 const data = await res.json();
-                
                 if (!data.found) {
                     document.getElementById('statusBadge').innerHTML = '❌ Not Found';
-                    document.getElementById('uptime').innerHTML = '—';
                     document.getElementById('logBox').innerHTML = 'Task not found';
                     return;
                 }
-                
                 startedAt = data.startedAt;
                 document.getElementById('statusBadge').innerHTML = data.isRunning ? '🟢 Running' : '🔴 Stopped';
-                
                 const logBox = document.getElementById('logBox');
                 logBox.innerHTML = data.logs.map(l => {
                     let cls = '';
@@ -456,20 +475,13 @@ app.get('/', (req, res) => {
                 logBox.scrollTop = logBox.scrollHeight;
             } catch(e) {}
         }
-
         async function stopTask() {
             const taskId = document.getElementById('monitorTaskId').value.trim();
             if (!taskId) { alert('Task ID daalein!'); return; }
-            if (!confirm('Task ' + taskId + ' stop karein? Auto-resume bhi band ho jayega.')) return;
-            
-            await fetch('/api/stop', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ taskId })
-            });
+            if (!confirm('Stop ' + taskId + '?')) return;
+            await fetch('/api/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ taskId }) });
             fetchStatus();
         }
-
         setInterval(() => {
             if (!startedAt) return;
             const elapsed = Date.now() - startedAt;
@@ -488,92 +500,53 @@ app.get('/', (req, res) => {
 // ================== COOKIE CHECKER API ==================
 app.post('/api/check-cookies', async (req, res) => {
     const { cookies } = req.body;
-    
-    if (!cookies || cookies.trim().length === 0) {
-        return res.json({ valid: false, error: 'Cookies khali hain!' });
-    }
+    if (!cookies || cookies.trim().length === 0) return res.json({ valid: false, error: 'Cookies khali!' });
     
     let context = null;
-    
     try {
         const parsedCookies = parseCookies(cookies);
-        
         const cUserCookie = parsedCookies.find(c => c.name === 'c_user');
         const xsCookie = parsedCookies.find(c => c.name === 'xs');
-        const datrCookie = parsedCookies.find(c => c.name === 'datr');
         
         if (!cUserCookie || !xsCookie) {
-            return res.json({ 
-                valid: false, 
-                error: 'Zaruri cookies missing hain!',
-                missing: { c_user: !cUserCookie, xs: !xsCookie, datr: !datrCookie }
-            });
+            return res.json({ valid: false, error: 'c_user ya xs missing' });
         }
         
         const userId = cUserCookie.value;
+        const checkProfileDir = path.join(DATA_DIR, 'cookie-check-temp');
+        try { if (fs.existsSync(checkProfileDir)) fs.rmSync(checkProfileDir, { recursive: true, force: true }); } catch(e) {}
         
-        const browser = await getBrowser();
-        context = await browser.newContext({
+        context = await chromium.launchPersistentContext(checkProfileDir, {
+            headless: true,
             viewport: { width: 1280, height: 720 },
             userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
         });
         
         await context.addCookies(parsedCookies);
         const page = await context.newPage();
-        
-        await page.goto('https://www.messenger.com/', { 
-            waitUntil: 'domcontentloaded', 
-            timeout: 45000 
-        });
-        
+        await page.goto('https://www.messenger.com/', { waitUntil: 'domcontentloaded', timeout: 45000 });
         await page.waitForTimeout(5000);
         
         const currentUrl = page.url();
-        const isLoggedIn = !currentUrl.includes('/login') && 
-                          !currentUrl.includes('checkpoint') && 
-                          !currentUrl.includes('/recover');
+        const isLoggedIn = !currentUrl.includes('/login') && !currentUrl.includes('checkpoint') && !currentUrl.includes('/recover');
         
         if (!isLoggedIn) {
             await safeCloseContext(context);
-            return res.json({ 
-                valid: false, 
-                error: 'Login page pe redirect hua',
-                redirect_url: currentUrl,
-                user_id: userId
-            });
+            try { fs.rmSync(checkProfileDir, { recursive: true, force: true }); } catch(e) {}
+            return res.json({ valid: false, error: 'Login page redirect', redirect_url: currentUrl, user_id: userId });
         }
         
         let userName = 'Unknown';
         try {
-            const nameSelectors = [
-                'div[aria-label*="Account"] span',
-                'div[role="banner"] span'
-            ];
-            for (const sel of nameSelectors) {
-                const el = await page.$(sel);
-                if (el) {
-                    const text = await el.innerText().catch(() => '');
-                    if (text && text.length > 1 && text.length < 50) {
-                        userName = text.trim();
-                        break;
-                    }
-                }
-            }
+            const el = await page.$('div[aria-label*="Account"] span, div[role="banner"] span');
+            if (el) { const t = await el.innerText().catch(() => ''); if (t && t.length < 50) userName = t.trim(); }
         } catch(e) {}
-        
-        const chatSidebar = await page.$('div[role="navigation"], div[aria-label*="Chats"]').catch(() => null);
         
         await safeCloseContext(context);
         context = null;
+        try { fs.rmSync(checkProfileDir, { recursive: true, force: true }); } catch(e) {}
         
-        return res.json({
-            valid: true,
-            user_id: userId,
-            user_name: userName,
-            chat_sidebar_found: !!chatSidebar,
-            cookie_count: parsedCookies.length
-        });
-        
+        return res.json({ valid: true, user_id: userId, user_name: userName, cookie_count: parsedCookies.length });
     } catch (err) {
         if (context) await safeCloseContext(context);
         return res.json({ valid: false, error: `Check fail: ${err.message}` });
@@ -593,16 +566,12 @@ app.post('/api/start', async (req, res) => {
     
     const taskId = "TASK-" + Math.floor(100000 + Math.random() * 900000);
     const startedAt = Date.now();
-    
     const originalData = { cookies, threadId, e2eePin, prefix, messages, delay, startedAt };
     
     const taskData = {
-        taskId,
-        isRunning: true,
-        startedAt,
+        taskId, isRunning: true, startedAt,
         logs: [`[${new Date().toLocaleTimeString()}] Task Initialized. ID: ${taskId}`],
-        context: null,
-        originalData
+        context: null, originalData
     };
 
     activeTasks.set(taskId, taskData);
@@ -612,47 +581,53 @@ app.post('/api/start', async (req, res) => {
         .catch(err => {
             console.log('[BOT CRASH]', err.message);
             const t = activeTasks.get(taskId);
-            if (t) {
-                t.isRunning = false;
-                t.logs.push(`[${new Date().toLocaleTimeString()}] [FATAL] ${err.message}`);
-            }
+            if (t) { t.isRunning = false; t.logs.push(`[FATAL] ${err.message}`); }
         });
 
     res.json({ success: true, taskId });
 });
 
 // ================== SESSION SETUP ==================
-async function setupSession(cookiesStr, threadId, e2eePin, addLog) {
-    const browser = await getBrowser();
+async function setupSession(taskId, cookiesStr, threadId, e2eePin, addLog, forceFresh = false) {
+    const { context } = await launchPersistentBrowser(taskId, cookiesStr, addLog, forceFresh);
     
-    const context = await browser.newContext({
-        viewport: { width: 1280, height: 720 },
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+    // Page event handlers (AUTO-RECOVERY)
+    context.on('close', () => {
+        addLog(`⚠️ Context closed event`);
     });
-
-    await context.addCookies(parseCookies(cookiesStr));
+    
     const page = await context.newPage();
+    
+    // Page crash handler
+    page.on('crash', () => {
+        addLog(`💥 Page crashed!`);
+    });
+    page.on('close', () => {
+        addLog(`⚠️ Page closed event`);
+    });
+    page.on('pageerror', (err) => {
+        addLog(`⚠️ Page error: ${err.message}`);
+    });
 
     addLog(`Navigating to Thread: ${threadId}`);
     await page.goto(`https://www.messenger.com/t/${threadId}`, { 
-        waitUntil: 'domcontentloaded', 
-        timeout: 60000 
+        waitUntil: 'domcontentloaded', timeout: 60000 
     });
 
+    await page.waitForTimeout(3000);
+
+    // E2EE PIN
     if (e2eePin) {
         try {
             const pinSelector = 'input[type="password"], input[aria-label*="PIN"], input[placeholder*="PIN"]';
             const pinInput = await page.waitForSelector(pinSelector, { timeout: 8000 }).catch(() => null);
-            
             if (pinInput) {
                 addLog(`E2EE PIN detected. Entering...`);
                 await pinInput.click();
                 await pinInput.fill(e2eePin);
                 await page.keyboard.press('Enter');
-
                 const submitBtn = await page.$('button[type="submit"], div[role="button"]:has-text("Continue"), div[role="button"]:has-text("Submit")').catch(() => null);
                 if (submitBtn) await submitBtn.click();
-
                 addLog(`PIN submitted. Waiting...`);
                 await page.waitForTimeout(6000);
             }
@@ -671,7 +646,6 @@ async function setupSession(cookiesStr, threadId, e2eePin, addLog) {
 
     let inputSelector = null;
     addLog(`Searching for input box...`);
-
     for (const selector of possibleSelectors) {
         try {
             await page.waitForSelector(selector, { timeout: 6000 });
@@ -682,10 +656,84 @@ async function setupSession(cookiesStr, threadId, e2eePin, addLog) {
 
     if (!inputSelector) {
         await safeCloseContext(context);
-        throw new Error(`Chat input box not found.`);
+        throw new Error(`Input box not found`);
     }
 
-    return { browser, context, page, inputSelector };
+    return { context, page, inputSelector };
+}
+
+// ================== SEND MESSAGE WITH RETRY ==================
+async function sendMessageWithRetry(page, inputSelector, finalPayload, addLog) {
+    for (let attempt = 1; attempt <= NETWORK_RETRY_ATTEMPTS; attempt++) {
+        try {
+            // Check session alive before each attempt
+            const sessionCheck = await isSessionAlive(page);
+            if (!sessionCheck.alive) {
+                return { success: false, reason: 'SESSION_DEAD', detail: sessionCheck.reason };
+            }
+            
+            await page.evaluate(({ selector, text }) => {
+                const el = document.querySelector(selector);
+                if (el) {
+                    el.focus();
+                    document.execCommand('selectAll', false, null);
+                    document.execCommand('delete', false, null);
+                    document.execCommand('insertText', false, text);
+                }
+            }, { selector: inputSelector, text: finalPayload });
+
+            await page.waitForTimeout(300);
+            await page.keyboard.press('Enter');
+            await page.waitForTimeout(1500);
+
+            // Verify: input box khali hua?
+            const stillThere = await page.evaluate((sel) => {
+                const el = document.querySelector(sel);
+                return el ? el.innerText.trim().length : -1;
+            }, inputSelector).catch(() => -1);
+
+            if (stillThere === -1) {
+                // Input box gone - session dead
+                return { success: false, reason: 'INPUT_GONE' };
+            }
+            
+            if (stillThere === 0) {
+                // Input empty - success
+                return { success: true };
+            }
+            
+            // Input still has text - retry
+            addLog(`⚠️ Attempt ${attempt}: Input still has text, retrying...`);
+            await page.waitForTimeout(2000);
+        } catch (err) {
+            addLog(`⚠️ Attempt ${attempt} error: ${err.message}`);
+            if (attempt < NETWORK_RETRY_ATTEMPTS) await sleep(3);
+        }
+    }
+    return { success: false, reason: 'MAX_RETRIES' };
+}
+
+// ================== AUTO RELOGIN ==================
+async function attemptRelogin(taskId, cookiesStr, threadId, e2eePin, addLog) {
+    addLog(`🔄 Attempting auto-relogin with original cookies...`);
+    
+    for (let attempt = 1; attempt <= RELOGIN_MAX_RETRIES; attempt++) {
+        try {
+            addLog(`🔐 Relogin attempt ${attempt}/${RELOGIN_MAX_RETRIES}...`);
+            killZombieChromium();
+            await sleep(3);
+            
+            // Force fresh profile with original cookies
+            const session = await setupSession(taskId, cookiesStr, threadId, e2eePin, addLog, true);
+            addLog(`✅ Relogin successful! Session fresh.`);
+            return session;
+        } catch (err) {
+            addLog(`❌ Relogin attempt ${attempt} failed: ${err.message}`);
+            if (attempt < RELOGIN_MAX_RETRIES) await sleep(10);
+        }
+    }
+    
+    return null;
 }
 
 // ================== MAIN BOT ==================
@@ -696,71 +744,96 @@ async function runPlaywrightBot(taskId, cookiesStr, threadId, e2eePin, prefix, m
     const addLog = (msg) => {
         if (!task.logs) task.logs = [];
         task.logs.push(`[${new Date().toLocaleTimeString()}] ${msg}`);
-        if (task.logs.length > 150) task.logs.shift();
+        if (task.logs.length > 200) task.logs.shift();
     };
 
     let context = null;
     let page = null;
     let inputSelector = null;
     let lastRestart = Date.now();
+    let lastSuccessfulSend = Date.now();
+    let consecutiveFailures = 0;
 
     try {
         addLog(`Setting up session...`);
-        const session = await setupSession(cookiesStr, threadId, e2eePin, addLog);
+        const session = await setupSession(taskId, cookiesStr, threadId, e2eePin, addLog);
         context = session.context;
         page = session.page;
         inputSelector = session.inputSelector;
         task.context = context;
 
         addLog(`✅ Connected. Loop started.`);
-        addLog(`⏰ Browser restart har ${BROWSER_RESTART_INTERVAL/3600000}h me.`);
+        addLog(`⏰ 8h browser restart | 🛡️ Session check every ${SESSION_CHECK_EVERY} msg`);
+        addLog(`🐕 Watchdog: ${WATCHDOG_TIMEOUT/60000}min no-send = restart`);
 
         let index = 0;
         let msgCount = 0;
 
         while (task.isRunning) {
             
-            // ========== 6 HOUR BROWSER RESTART (WITH RETRY) ==========
+            // ========== 8 HOUR BROWSER RESTART ==========
             if (Date.now() - lastRestart >= BROWSER_RESTART_INTERVAL) {
-                addLog(`🔄 ${BROWSER_RESTART_INTERVAL/3600000}h complete. Browser restart...`);
-                
+                addLog(`🔄 8h complete. Browser restart...`);
                 await safeCloseContext(context);
-                context = null;
-                page = null;
-                
-                if (GLOBAL_BROWSER) {
-                    try { await GLOBAL_BROWSER.close(); } catch(e) {}
-                    GLOBAL_BROWSER = null;
-                }
-                
+                context = null; page = null;
                 killZombieChromium();
                 await sleep(3);
                 
-                // Retry logic
                 let success = false;
                 for (let attempt = 1; attempt <= RESTART_MAX_RETRIES; attempt++) {
                     try {
-                        addLog(`🔄 Restart attempt ${attempt}/${RESTART_MAX_RETRIES}...`);
-                        const newSession = await setupSession(cookiesStr, threadId, e2eePin, addLog);
+                        const newSession = await setupSession(taskId, cookiesStr, threadId, e2eePin, addLog);
                         context = newSession.context;
                         page = newSession.page;
                         inputSelector = newSession.inputSelector;
                         task.context = context;
                         lastRestart = Date.now();
-                        addLog(`✅ Browser restarted successfully.`);
+                        lastSuccessfulSend = Date.now();
+                        addLog(`✅ Browser restarted.`);
                         success = true;
                         break;
                     } catch (rErr) {
-                        addLog(`⚠️ Attempt ${attempt} failed: ${rErr.message}`);
-                        if (attempt < RESTART_MAX_RETRIES) {
-                            killZombieChromium();
-                            await sleep(RESTART_RETRY_DELAY / 1000);
-                        }
+                        addLog(`⚠️ Restart ${attempt} fail: ${rErr.message}`);
+                        if (attempt < RESTART_MAX_RETRIES) { killZombieChromium(); await sleep(RESTART_RETRY_DELAY / 1000); }
                     }
                 }
-                
                 if (!success) {
-                    addLog(`❌ All ${RESTART_MAX_RETRIES} attempts failed. Stopping.`);
+                    addLog(`❌ Restart fail. Trying relogin...`);
+                    const reloginSession = await attemptRelogin(taskId, cookiesStr, threadId, e2eePin, addLog);
+                    if (reloginSession) {
+                        context = reloginSession.context;
+                        page = reloginSession.page;
+                        inputSelector = reloginSession.inputSelector;
+                        task.context = context;
+                        lastRestart = Date.now();
+                        lastSuccessfulSend = Date.now();
+                    } else {
+                        addLog(`❌ Relogin fail. Task stop.`);
+                        task.isRunning = false;
+                        break;
+                    }
+                }
+            }
+            
+            // ========== WATCHDOG ==========
+            if (Date.now() - lastSuccessfulSend > WATCHDOG_TIMEOUT) {
+                addLog(`🐕 Watchdog: ${WATCHDOG_TIMEOUT/60000}min no successful send. Force restart...`);
+                await safeCloseContext(context);
+                context = null; page = null;
+                killZombieChromium();
+                await sleep(3);
+                
+                const reloginSession = await attemptRelogin(taskId, cookiesStr, threadId, e2eePin, addLog);
+                if (reloginSession) {
+                    context = reloginSession.context;
+                    page = reloginSession.page;
+                    inputSelector = reloginSession.inputSelector;
+                    task.context = context;
+                    lastRestart = Date.now();
+                    lastSuccessfulSend = Date.now();
+                    consecutiveFailures = 0;
+                } else {
+                    addLog(`❌ Watchdog recovery fail. Stop.`);
                     task.isRunning = false;
                     break;
                 }
@@ -768,48 +841,105 @@ async function runPlaywrightBot(taskId, cookiesStr, threadId, e2eePin, prefix, m
             
             // ========== HEALTH CHECK ==========
             if (!page || page.isClosed()) {
-                addLog(`❌ Page closed. Stopping.`);
-                break;
+                addLog(`⚠️ Page closed. Attempting recovery...`);
+                const reloginSession = await attemptRelogin(taskId, cookiesStr, threadId, e2eePin, addLog);
+                if (reloginSession) {
+                    context = reloginSession.context;
+                    page = reloginSession.page;
+                    inputSelector = reloginSession.inputSelector;
+                    task.context = context;
+                    lastRestart = Date.now();
+                    lastSuccessfulSend = Date.now();
+                    continue;
+                } else {
+                    addLog(`❌ Recovery fail. Stop.`);
+                    break;
+                }
+            }
+
+            // ========== SESSION CHECK (every N messages) ==========
+            if (msgCount > 0 && msgCount % SESSION_CHECK_EVERY === 0) {
+                const check = await isSessionAlive(page);
+                if (!check.alive) {
+                    addLog(`🚨 Session dead: ${check.reason}`);
+                    addLog(`🔄 Auto-relogin try kar raha hoon...`);
+                    
+                    await safeCloseContext(context);
+                    context = null; page = null;
+                    
+                    const reloginSession = await attemptRelogin(taskId, cookiesStr, threadId, e2eePin, addLog);
+                    if (reloginSession) {
+                        context = reloginSession.context;
+                        page = reloginSession.page;
+                        inputSelector = reloginSession.inputSelector;
+                        task.context = context;
+                        lastRestart = Date.now();
+                        lastSuccessfulSend = Date.now();
+                        consecutiveFailures = 0;
+                        addLog(`✅ Session recovered!`);
+                        continue;
+                    } else {
+                        addLog(`❌ Auto-relogin fail. Task stop. Fresh cookies lo.`);
+                        task.isRunning = false;
+                        break;
+                    }
+                }
             }
 
             const rawMsg = messages[index];
             const finalPayload = (prefix ? prefix + " " : "") + rawMsg;
 
-            try {
-                await page.evaluate(({ selector, text }) => {
-                    const el = document.querySelector(selector);
-                    if (el) {
-                        el.focus();
-                        document.execCommand('selectAll', false, null);
-                        document.execCommand('delete', false, null);
-                        document.execCommand('insertText', false, text);
-                    }
-                }, { selector: inputSelector, text: finalPayload });
-
-                await page.waitForTimeout(200);
-                await page.keyboard.press('Enter');
-
-                addLog(`Message Sent: "${finalPayload.substring(0, 50)}"`);
-            } catch (err) {
-                addLog(`⚠️ Send Error: ${err.message}`);
+            // ========== SEND MESSAGE ==========
+            const result = await sendMessageWithRetry(page, inputSelector, finalPayload, addLog);
+            
+            if (result.success) {
+                addLog(`✅ Sent: "${finalPayload.substring(0, 50)}"`);
+                lastSuccessfulSend = Date.now();
+                consecutiveFailures = 0;
+            } else if (result.reason === 'SESSION_DEAD' || result.reason === 'INPUT_GONE') {
+                addLog(`🚨 Session dead during send: ${result.detail || result.reason}`);
+                addLog(`🔄 Auto-relogin...`);
                 
-                if (err.message.includes('Target closed') || err.message.includes('evaluate')) {
-                    try {
-                        addLog(`🔄 Reloading...`);
-                        await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 });
-                        await page.waitForTimeout(5000);
-                        
-                        for (const selector of ['div[role="textbox"][contenteditable="true"]', 'div[contenteditable="true"]']) {
-                            try {
-                                await page.waitForSelector(selector, { timeout: 6000 });
-                                inputSelector = selector;
-                                break;
-                            } catch (e) {}
-                        }
-                        if (!inputSelector) break;
+                await safeCloseContext(context);
+                context = null; page = null;
+                
+                const reloginSession = await attemptRelogin(taskId, cookiesStr, threadId, e2eePin, addLog);
+                if (reloginSession) {
+                    context = reloginSession.context;
+                    page = reloginSession.page;
+                    inputSelector = reloginSession.inputSelector;
+                    task.context = context;
+                    lastRestart = Date.now();
+                    lastSuccessfulSend = Date.now();
+                    continue;
+                } else {
+                    addLog(`❌ Relogin fail. Stop.`);
+                    task.isRunning = false;
+                    break;
+                }
+            } else {
+                consecutiveFailures++;
+                addLog(`⚠️ Send fail (${result.reason}). Failures: ${consecutiveFailures}/3`);
+                
+                if (consecutiveFailures >= 3) {
+                    addLog(`🚨 3 consecutive failures. Force recovery...`);
+                    consecutiveFailures = 0;
+                    
+                    await safeCloseContext(context);
+                    context = null; page = null;
+                    
+                    const reloginSession = await attemptRelogin(taskId, cookiesStr, threadId, e2eePin, addLog);
+                    if (reloginSession) {
+                        context = reloginSession.context;
+                        page = reloginSession.page;
+                        inputSelector = reloginSession.inputSelector;
+                        task.context = context;
+                        lastRestart = Date.now();
+                        lastSuccessfulSend = Date.now();
                         continue;
-                    } catch (rErr) {
-                        addLog(`❌ Reload fail. Stopping.`);
+                    } else {
+                        addLog(`❌ Recovery fail. Stop.`);
+                        task.isRunning = false;
                         break;
                     }
                 }
@@ -818,18 +948,14 @@ async function runPlaywrightBot(taskId, cookiesStr, threadId, e2eePin, prefix, m
             index = (index + 1) % messages.length;
             msgCount++;
 
+            // ========== MEMORY CLEANUP ==========
             if (msgCount > 0 && msgCount % PAGE_RELOAD_EVERY === 0) {
                 addLog(`🔄 Memory cleanup (msg #${msgCount})...`);
                 try {
                     await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 });
                     await page.waitForTimeout(5000);
-                    
                     for (const selector of ['div[role="textbox"][contenteditable="true"]', 'div[contenteditable="true"]']) {
-                        try {
-                            await page.waitForSelector(selector, { timeout: 6000 });
-                            inputSelector = selector;
-                            break;
-                        } catch (e) {}
+                        try { await page.waitForSelector(selector, { timeout: 6000 }); inputSelector = selector; break; } catch (e) {}
                     }
                     addLog(`✅ Memory cleaned.`);
                 } catch (rErr) {
@@ -858,18 +984,12 @@ async function runPlaywrightBot(taskId, cookiesStr, threadId, e2eePin, prefix, m
 app.get('/api/status/:taskId', (req, res) => {
     const task = activeTasks.get(req.params.taskId);
     if (!task) return res.json({ found: false });
-    res.json({
-        found: true,
-        taskId: task.taskId,
-        isRunning: task.isRunning,
-        startedAt: task.startedAt,
-        logs: task.logs || []
-    });
+    res.json({ found: true, taskId: task.taskId, isRunning: task.isRunning, startedAt: task.startedAt, logs: task.logs || [] });
 });
 
 app.get('/api/logs/:taskId', (req, res) => {
     const task = activeTasks.get(req.params.taskId);
-    if (!task) return res.json({ logs: ["Task not found or expired."] });
+    if (!task) return res.json({ logs: ["Task not found."] });
     res.json({ logs: task.logs });
 });
 
@@ -881,9 +1001,13 @@ app.post('/api/stop', async (req, res) => {
 
     task.isRunning = false;
     task.originalData = null;
-    
     if (task.context) await safeCloseContext(task.context);
-    if (task.logs) task.logs.push(`[${new Date().toLocaleTimeString()}] 🛑 Stopped. Auto-resume disabled.`);
+    if (task.logs) task.logs.push(`[${new Date().toLocaleTimeString()}] 🛑 Stopped.`);
+    
+    try {
+        const profileDir = path.join(DATA_DIR, `browser-profile-${taskId}`);
+        if (fs.existsSync(profileDir)) fs.rmSync(profileDir, { recursive: true, force: true });
+    } catch(e) {}
     
     saveTasksToDisk();
     res.json({ message: `Task ${taskId} stopped!` });
@@ -893,23 +1017,21 @@ app.post('/api/stop', async (req, res) => {
 app.get('/health', (req, res) => {
     const mem = process.memoryUsage();
     let totalRamMB = Math.round(mem.rss / 1024 / 1024);
-    
     try {
-        const psOutput = execSync('ps aux --sort=-rss | head -20', { encoding: 'utf8' });
-        let totalKB = 0;
-        psOutput.split('\n').slice(1).forEach(line => {
-            const parts = line.trim().split(/\s+/);
-            if (parts[5]) totalKB += parseInt(parts[5]) || 0;
-        });
-        totalRamMB = Math.round(totalKB / 1024);
+        if (fs.existsSync('/sys/fs/cgroup/memory.current')) {
+            const bytes = parseInt(fs.readFileSync('/sys/fs/cgroup/memory.current', 'utf8').trim());
+            totalRamMB = Math.round(bytes / 1024 / 1024);
+        } else if (fs.existsSync('/sys/fs/cgroup/memory/memory.usage_in_bytes')) {
+            const bytes = parseInt(fs.readFileSync('/sys/fs/cgroup/memory/memory.usage_in_bytes', 'utf8').trim());
+            totalRamMB = Math.round(bytes / 1024 / 1024);
+        }
     } catch(e) {}
     
     let tasksData = {};
-    try {
-        if (fs.existsSync(TASKS_FILE)) {
-            tasksData = JSON.parse(fs.readFileSync(TASKS_FILE, 'utf8'));
-        }
-    } catch(e) {}
+    try { if (fs.existsSync(TASKS_FILE)) tasksData = JSON.parse(fs.readFileSync(TASKS_FILE, 'utf8')); } catch(e) {}
+    
+    let profiles = [];
+    try { profiles = fs.readdirSync(DATA_DIR).filter(f => f.startsWith('browser-profile-')); } catch(e) {}
     
     res.json({
         status: 'ok',
@@ -918,7 +1040,7 @@ app.get('/health', (req, res) => {
         total_ram_mb: totalRamMB,
         active_tasks: Array.from(activeTasks.keys()).filter(k => activeTasks.get(k).isRunning),
         saved_tasks: Object.keys(tasksData),
-        browser_alive: GLOBAL_BROWSER?.isConnected() || false,
+        browser_profiles: profiles,
         volume_mounted: fs.existsSync(DATA_DIR)
     });
 });
@@ -927,18 +1049,27 @@ app.get('/health', (req, res) => {
 setInterval(() => {
     const mem = process.memoryUsage();
     const rssMB = Math.round(mem.rss / 1024 / 1024);
-    console.log(`[MEMORY] RSS: ${rssMB}MB`);
+    let totalMB = rssMB;
+    try {
+        if (fs.existsSync('/sys/fs/cgroup/memory.current')) {
+            const bytes = parseInt(fs.readFileSync('/sys/fs/cgroup/memory.current', 'utf8').trim());
+            totalMB = Math.round(bytes / 1024 / 1024);
+        }
+    } catch(e) {}
     
-    if (rssMB > MEMORY_LIMIT_MB) {
-        console.log('⚠️ High memory! Restarting browser...');
-        if (GLOBAL_BROWSER) {
-            GLOBAL_BROWSER.close().catch(() => {});
-            GLOBAL_BROWSER = null;
+    console.log(`[MEMORY] Node: ${rssMB}MB | Total: ${totalMB}MB`);
+    
+    if (totalMB > MEMORY_LIMIT_MB) {
+        console.log(`⚠️ Memory high (${totalMB}MB). Killing contexts...`);
+        for (const [id, t] of activeTasks.entries()) {
+            if (t.isRunning && t.context) {
+                t.context.close().catch(() => {});
+            }
         }
     }
 }, 2 * 60 * 1000);
 
-// ================== PERIODIC SAVE (EVERY 5 MIN) ==================
+// ================== PERIODIC SAVE ==================
 setInterval(() => {
     const runningCount = Array.from(activeTasks.values()).filter(t => t.isRunning).length;
     if (runningCount > 0) saveTasksToDisk();
@@ -949,7 +1080,5 @@ const PORT = process.env.PORT || 8080;
 server.listen(PORT, '0.0.0.0', async () => {
     console.log(`Server running on port ${PORT}`);
     console.log(`📂 Volume: ${DATA_DIR}`);
-    console.log(`📂 Tasks: ${TASKS_FILE}`);
-    
     await loadTasksFromDisk();
 });
