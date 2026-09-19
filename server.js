@@ -44,17 +44,17 @@ process.on('SIGINT', async () => {
 });
 
 // ================== CONFIG ==================
-const BROWSER_RESTART_INTERVAL = 8 * 60 * 60 * 1000;   // 8 hours
-const PAGE_RELOAD_EVERY = 30;                           // 30 messages
-const MEMORY_LIMIT_MB = 800;
+const BROWSER_RESTART_INTERVAL = 12 * 60 * 60 * 1000;   // 12 hours
+const PAGE_RELOAD_EVERY = 30;
+const MEMORY_LIMIT_MB = 950;                             // 950 MB (unnecessary restart rokne ke liye)
 const CONTEXT_CLOSE_TIMEOUT = 20000;
 const BROWSER_LAUNCH_TIMEOUT = 60000;
 const RESTART_MAX_RETRIES = 5;
 const RESTART_RETRY_DELAY = 10000;
-const SESSION_CHECK_EVERY = 3;                          // Check session every 3 messages
-const WATCHDOG_TIMEOUT = 15 * 60 * 1000;                // 15 min no send = restart
-const RELOGIN_MAX_RETRIES = 3;                          // Max re-login attempts
-const NETWORK_RETRY_ATTEMPTS = 5;                       // Network retry
+const SESSION_CHECK_EVERY = 3;
+const WATCHDOG_TIMEOUT = 15 * 60 * 1000;
+const RELOGIN_MAX_RETRIES = 3;
+const NETWORK_RETRY_ATTEMPTS = 5;
 
 // ================== ACTIVE TASKS ==================
 const activeTasks = new Map();
@@ -109,45 +109,36 @@ async function safeCloseContext(context) {
     }
 }
 
-// ================== SESSION ALIVE CHECK (CRITICAL) ==================
+// ================== SESSION ALIVE CHECK ==================
 async function isSessionAlive(page) {
     try {
-        // 1. Page band ho gaya?
         if (!page || page.isClosed()) {
             return { alive: false, reason: 'Page closed' };
         }
         
-        // 2. URL check
         const url = page.url();
         if (url.includes('/login') || url.includes('checkpoint') || 
             url.includes('/recover') || url.includes('/help/contact')) {
             return { alive: false, reason: `URL redirect: ${url}` };
         }
         
-        // 3. Title check
         const title = await page.title().catch(() => '');
         const titleLower = title.toLowerCase();
         if (titleLower.includes('log in') || titleLower.includes('sign in') || 
-            titleLower.includes('login') || titleLower.includes('facebook')) {
-            // Facebook title normal bhi "Messenger" hota hai, so check karo
-            if (titleLower !== 'messenger' && titleLower !== '(1) messenger') {
-                return { alive: false, reason: `Login title: ${title}` };
-            }
+            titleLower.includes('login')) {
+            return { alive: false, reason: `Login title: ${title}` };
         }
         
-        // 4. Input box exist karta hai?
         const inputBox = await page.$('div[contenteditable="true"][role="textbox"], div[contenteditable="true"]').catch(() => null);
         if (!inputBox) {
             return { alive: false, reason: 'Input box missing' };
         }
         
-        // 5. "Log in" button check
         const loginBtn = await page.$('button:has-text("Log in"), a:has-text("Log in"), div[role="button"]:has-text("Log in")').catch(() => null);
         if (loginBtn) {
             return { alive: false, reason: 'Login button detected' };
         }
         
-        // 6. Password field check
         const pwdField = await page.$('input[type="password"]').catch(() => null);
         if (pwdField) {
             return { alive: false, reason: 'Password field detected' };
@@ -238,7 +229,6 @@ async function launchPersistentBrowser(taskId, cookiesStr, addLog, forceFresh = 
         }
     } catch(e) {}
     
-    // If forced fresh, delete old profile
     if (forceFresh && fs.existsSync(userDataDir)) {
         try {
             fs.rmSync(userDataDir, { recursive: true, force: true });
@@ -252,7 +242,6 @@ async function launchPersistentBrowser(taskId, cookiesStr, addLog, forceFresh = 
         addLog(`🔄 Existing profile. Saved session use hoga.`);
     }
     
-    // Backup existing profile before launching (safety)
     if (!isFreshProfile && fs.existsSync(userDataDir)) {
         try {
             if (fs.existsSync(backupDir)) fs.rmSync(backupDir, { recursive: true, force: true });
@@ -303,7 +292,6 @@ async function launchPersistentBrowser(taskId, cookiesStr, addLog, forceFresh = 
     
     const context = await Promise.race([launchPromise, timeoutPromise]);
     
-    // Stealth patches
     await context.addInitScript(() => {
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
         window.chrome = { runtime: {} };
@@ -321,7 +309,7 @@ async function launchPersistentBrowser(taskId, cookiesStr, addLog, forceFresh = 
     return { context, isFreshProfile };
 }
 
-// ================== DASHBOARD UI (Same as before, keeping it) ==================
+// ================== DASHBOARD UI ==================
 app.get('/', (req, res) => {
     res.send(`
 <!DOCTYPE html>
@@ -368,7 +356,7 @@ app.get('/', (req, res) => {
     <div class="container">
         <h2>Messenger Automation Bot</h2>
         <div class="developer-tag">DEVELOPED BY : RAJ MISHRA</div>
-        <div class="info-banner">♻️ 24/7 Auto-Recovery — Persistent Profile + Session Check + Watchdog</div>
+        <div class="info-banner">♻️ 12h Restart | 950MB Safe | Persistent Profile + Auto-Relogin</div>
         
         <form id="botForm">
             <label>Messenger Cookie String:</label>
@@ -386,7 +374,7 @@ app.get('/', (req, res) => {
             <label>Messages (.txt File):</label>
             <input type="file" id="msgFile" accept=".txt" required>
             <label>Delay (In Seconds):</label>
-            <input type="number" id="delay" value="30" min="5" required>
+            <input type="number" id="delay" value="120" min="5" required>
             <button type="button" class="btn-start" onclick="startTask()">START TASK</button>
         </form>
         <div class="divider"></div>
@@ -591,14 +579,12 @@ app.post('/api/start', async (req, res) => {
 async function setupSession(taskId, cookiesStr, threadId, e2eePin, addLog, forceFresh = false) {
     const { context } = await launchPersistentBrowser(taskId, cookiesStr, addLog, forceFresh);
     
-    // Page event handlers (AUTO-RECOVERY)
     context.on('close', () => {
         addLog(`⚠️ Context closed event`);
     });
     
     const page = await context.newPage();
     
-    // Page crash handler
     page.on('crash', () => {
         addLog(`💥 Page crashed!`);
     });
@@ -616,7 +602,6 @@ async function setupSession(taskId, cookiesStr, threadId, e2eePin, addLog, force
 
     await page.waitForTimeout(3000);
 
-    // E2EE PIN
     if (e2eePin) {
         try {
             const pinSelector = 'input[type="password"], input[aria-label*="PIN"], input[placeholder*="PIN"]';
@@ -666,7 +651,6 @@ async function setupSession(taskId, cookiesStr, threadId, e2eePin, addLog, force
 async function sendMessageWithRetry(page, inputSelector, finalPayload, addLog) {
     for (let attempt = 1; attempt <= NETWORK_RETRY_ATTEMPTS; attempt++) {
         try {
-            // Check session alive before each attempt
             const sessionCheck = await isSessionAlive(page);
             if (!sessionCheck.alive) {
                 return { success: false, reason: 'SESSION_DEAD', detail: sessionCheck.reason };
@@ -686,23 +670,19 @@ async function sendMessageWithRetry(page, inputSelector, finalPayload, addLog) {
             await page.keyboard.press('Enter');
             await page.waitForTimeout(1500);
 
-            // Verify: input box khali hua?
             const stillThere = await page.evaluate((sel) => {
                 const el = document.querySelector(sel);
                 return el ? el.innerText.trim().length : -1;
             }, inputSelector).catch(() => -1);
 
             if (stillThere === -1) {
-                // Input box gone - session dead
                 return { success: false, reason: 'INPUT_GONE' };
             }
             
             if (stillThere === 0) {
-                // Input empty - success
                 return { success: true };
             }
             
-            // Input still has text - retry
             addLog(`⚠️ Attempt ${attempt}: Input still has text, retrying...`);
             await page.waitForTimeout(2000);
         } catch (err) {
@@ -723,9 +703,8 @@ async function attemptRelogin(taskId, cookiesStr, threadId, e2eePin, addLog) {
             killZombieChromium();
             await sleep(3);
             
-            // Force fresh profile with original cookies
             const session = await setupSession(taskId, cookiesStr, threadId, e2eePin, addLog, true);
-            addLog(`✅ Relogin successful! Session fresh.`);
+            addLog(`✅ Relogin successful!`);
             return session;
         } catch (err) {
             addLog(`❌ Relogin attempt ${attempt} failed: ${err.message}`);
@@ -763,17 +742,17 @@ async function runPlaywrightBot(taskId, cookiesStr, threadId, e2eePin, prefix, m
         task.context = context;
 
         addLog(`✅ Connected. Loop started.`);
-        addLog(`⏰ 8h browser restart | 🛡️ Session check every ${SESSION_CHECK_EVERY} msg`);
-        addLog(`🐕 Watchdog: ${WATCHDOG_TIMEOUT/60000}min no-send = restart`);
+        addLog(`⏰ 12h browser restart | 🛡️ Session check every ${SESSION_CHECK_EVERY} msg`);
+        addLog(`💾 950 MB memory limit | 🐕 Watchdog: ${WATCHDOG_TIMEOUT/60000}min`);
 
         let index = 0;
         let msgCount = 0;
 
         while (task.isRunning) {
             
-            // ========== 8 HOUR BROWSER RESTART ==========
+            // ========== 12 HOUR BROWSER RESTART ==========
             if (Date.now() - lastRestart >= BROWSER_RESTART_INTERVAL) {
-                addLog(`🔄 8h complete. Browser restart...`);
+                addLog(`🔄 12h complete. Browser restart...`);
                 await safeCloseContext(context);
                 context = null; page = null;
                 killZombieChromium();
@@ -857,7 +836,7 @@ async function runPlaywrightBot(taskId, cookiesStr, threadId, e2eePin, prefix, m
                 }
             }
 
-            // ========== SESSION CHECK (every N messages) ==========
+            // ========== SESSION CHECK ==========
             if (msgCount > 0 && msgCount % SESSION_CHECK_EVERY === 0) {
                 const check = await isSessionAlive(page);
                 if (!check.alive) {
@@ -889,7 +868,6 @@ async function runPlaywrightBot(taskId, cookiesStr, threadId, e2eePin, prefix, m
             const rawMsg = messages[index];
             const finalPayload = (prefix ? prefix + " " : "") + rawMsg;
 
-            // ========== SEND MESSAGE ==========
             const result = await sendMessageWithRetry(page, inputSelector, finalPayload, addLog);
             
             if (result.success) {
@@ -963,7 +941,6 @@ async function runPlaywrightBot(taskId, cookiesStr, threadId, e2eePin, prefix, m
                 }
             }
 
-            // FIXED DELAY
             for (let i = 0; i < delay; i++) {
                 if (!task.isRunning) break;
                 await sleep(1);
@@ -1038,6 +1015,8 @@ app.get('/health', (req, res) => {
         uptime: Math.round(process.uptime()) + 's',
         node_ram_mb: Math.round(mem.rss / 1024 / 1024),
         total_ram_mb: totalRamMB,
+        memory_limit_mb: MEMORY_LIMIT_MB,
+        restart_interval_hours: BROWSER_RESTART_INTERVAL / 3600000,
         active_tasks: Array.from(activeTasks.keys()).filter(k => activeTasks.get(k).isRunning),
         saved_tasks: Object.keys(tasksData),
         browser_profiles: profiles,
@@ -1057,10 +1036,10 @@ setInterval(() => {
         }
     } catch(e) {}
     
-    console.log(`[MEMORY] Node: ${rssMB}MB | Total: ${totalMB}MB`);
+    console.log(`[MEMORY] Node: ${rssMB}MB | Total: ${totalMB}MB | Limit: ${MEMORY_LIMIT_MB}MB`);
     
     if (totalMB > MEMORY_LIMIT_MB) {
-        console.log(`⚠️ Memory high (${totalMB}MB). Killing contexts...`);
+        console.log(`⚠️ Memory high (${totalMB}MB > ${MEMORY_LIMIT_MB}MB). Killing contexts...`);
         for (const [id, t] of activeTasks.entries()) {
             if (t.isRunning && t.context) {
                 t.context.close().catch(() => {});
@@ -1080,5 +1059,6 @@ const PORT = process.env.PORT || 8080;
 server.listen(PORT, '0.0.0.0', async () => {
     console.log(`Server running on port ${PORT}`);
     console.log(`📂 Volume: ${DATA_DIR}`);
+    console.log(`⏰ Restart every ${BROWSER_RESTART_INTERVAL/3600000}h | 💾 Memory limit: ${MEMORY_LIMIT_MB}MB`);
     await loadTasksFromDisk();
 });
