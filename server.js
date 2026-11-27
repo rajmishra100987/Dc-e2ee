@@ -46,7 +46,7 @@ process.on('SIGINT', async () => {
 // ================== CONFIG ==================
 const BROWSER_RESTART_INTERVAL = 12 * 60 * 60 * 1000;   // 12 hours
 const PAGE_RELOAD_EVERY = 30;
-const MEMORY_LIMIT_MB = 950;                             // 950 MB (unnecessary restart rokne ke liye)
+const MEMORY_LIMIT_MB = 900;                             // Hostless safe limit
 const CONTEXT_CLOSE_TIMEOUT = 20000;
 const BROWSER_LAUNCH_TIMEOUT = 60000;
 const RESTART_MAX_RETRIES = 5;
@@ -282,7 +282,8 @@ async function launchPersistentBrowser(taskId, cookiesStr, addLog, forceFresh = 
             '--no-pings',
             '--password-store=basic',
             '--use-mock-keychain',
-            '--memory-pressure-off'
+            '--memory-pressure-off',
+            '--disable-crashpad' // Hostless ke liye extra safety
         ]
     });
     
@@ -356,7 +357,7 @@ app.get('/', (req, res) => {
     <div class="container">
         <h2>Messenger Automation Bot</h2>
         <div class="developer-tag">DEVELOPED BY : RAJ MISHRA</div>
-        <div class="info-banner">♻️ 12h Restart | 950MB Safe | Persistent Profile + Auto-Relogin</div>
+        <div class="info-banner">♻️ 12h Restart | 900MB Safe | Persistent Profile + Auto-Relogin</div>
         
         <form id="botForm">
             <label>Messenger Cookie String:</label>
@@ -743,7 +744,7 @@ async function runPlaywrightBot(taskId, cookiesStr, threadId, e2eePin, prefix, m
 
         addLog(`✅ Connected. Loop started.`);
         addLog(`⏰ 12h browser restart | 🛡️ Session check every ${SESSION_CHECK_EVERY} msg`);
-        addLog(`💾 950 MB memory limit | 🐕 Watchdog: ${WATCHDOG_TIMEOUT/60000}min`);
+        addLog(`💾 900 MB memory limit | 🐕 Watchdog: ${WATCHDOG_TIMEOUT/60000}min`);
 
         let index = 0;
         let msgCount = 0;
